@@ -100,27 +100,27 @@
 ### 运行所有 pg-unsupported 测试 (大部分会被跳过)
 
 ```bash
-cd test/integration/pg-unsupported
-INTEGRATION_TEST=1 go test -v ./...
+cd test/pg-unsupported
+go test -v ./...
 ```
 
 ### 运行特定测试
 
 ```bash
 # 测试 ENUM 类型
-INTEGRATION_TEST=1 go test -v -run TestMySQLSpecific_ENUM
+go test -v -run TestMySQLSpecific_ENUM
 
 # 测试 REPLACE INTO
-INTEGRATION_TEST=1 go test -v -run TestMySQLSpecific_REPLACE_INTO
+go test -v -run TestMySQLSpecific_REPLACE_INTO
 
 # 测试全文搜索
-INTEGRATION_TEST=1 go test -v -run TestMySQLSpecific_MATCH_AGAINST
+go test -v -run TestMySQLSpecific_MATCH_AGAINST
 ```
 
 ### 查看所有跳过的测试
 
 ```bash
-INTEGRATION_TEST=1 go test -v ./... 2>&1 | grep SKIP
+go test -v ./... 2>&1 | grep SKIP
 ```
 
 ## 状态图例

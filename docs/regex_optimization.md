@@ -145,7 +145,6 @@ colRe := regexp.MustCompile(`(?i)` + stmt.TableName + `\s*\(([^)]+)\)\s+VALUES`)
 
 ```bash
 cd /Users/bast/code/aproxy && \
-export INTEGRATION_TEST=1 && \
 go test -v ./test/integration/... -run TestMySQLCompat -timeout 30s
 ```
 
