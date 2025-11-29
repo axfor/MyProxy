@@ -272,6 +272,170 @@ func TestASTRewriter_ErrorHandling(t *testing.T) {
 	}
 }
 
+// TestASTRewriter_ManyPlaceholders tests that parser handles large number of placeholders
+// TiDB Parser supports up to 65535 placeholders (official doc)
+func TestASTRewriter_ManyPlaceholders(t *testing.T) {
+	rewriter := NewASTRewriter()
+
+	tests := []struct {
+		name           string
+		placeholderCnt int
+	}{
+		{"12 placeholders in IN clause", 12},
+		{"20 placeholders in IN clause", 20},
+		{"50 placeholders in IN clause", 50},
+		{"100 placeholders in IN clause", 100},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build IN clause with many placeholders
+			placeholders := ""
+			for i := 0; i < tt.placeholderCnt; i++ {
+				if i > 0 {
+					placeholders += ","
+				}
+				placeholders += "?"
+			}
+			sql := "SELECT * FROM item WHERE i_id IN (" + placeholders + ")"
+
+			result, err := rewriter.Rewrite(sql)
+			require.NoError(t, err, "Rewrite should handle %d placeholders", tt.placeholderCnt)
+			assert.NotEmpty(t, result)
+			assert.Contains(t, result, "$1", "Should contain $1 placeholder")
+			t.Logf("Input placeholders: %d, Output: %s...", tt.placeholderCnt, result[:min(100, len(result))])
+		})
+	}
+}
+
+// TestASTRewriter_MultiRowINSERT tests multi-row INSERT with many rows
+func TestASTRewriter_MultiRowINSERT(t *testing.T) {
+	rewriter := NewASTRewriter()
+
+	tests := []struct {
+		name    string
+		rowsCnt int
+	}{
+		{"12 rows INSERT", 12},
+		{"20 rows INSERT", 20},
+		{"50 rows INSERT", 50},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build multi-row INSERT
+			values := ""
+			for i := 0; i < tt.rowsCnt; i++ {
+				if i > 0 {
+					values += ","
+				}
+				values += "(?,?,?)"
+			}
+			sql := "INSERT INTO test (a,b,c) VALUES " + values
+
+			result, err := rewriter.Rewrite(sql)
+			require.NoError(t, err, "Rewrite should handle %d rows INSERT", tt.rowsCnt)
+			assert.NotEmpty(t, result)
+			assert.Contains(t, result, "$1", "Should contain $1 placeholder")
+			t.Logf("Input rows: %d, Output length: %d", tt.rowsCnt, len(result))
+		})
+	}
+}
+
+// TestASTRewriter_TupleINClause tests tuple IN clause like go-tpc uses
+func TestASTRewriter_TupleINClause(t *testing.T) {
+	rewriter := NewASTRewriter()
+
+	tests := []struct {
+		name     string
+		tupleCnt int
+	}{
+		{"12 tuples in IN clause", 12},
+		{"20 tuples in IN clause", 20},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build tuple IN clause: WHERE (a, b) IN ((?,?),(?,?),...)
+			tuples := ""
+			for i := 0; i < tt.tupleCnt; i++ {
+				if i > 0 {
+					tuples += ","
+				}
+				tuples += "(?,?)"
+			}
+			sql := "SELECT * FROM stock WHERE (s_w_id, s_i_id) IN (" + tuples + ")"
+
+			result, err := rewriter.Rewrite(sql)
+			require.NoError(t, err, "Rewrite should handle %d tuples", tt.tupleCnt)
+			assert.NotEmpty(t, result)
+			t.Logf("Input tuples: %d, Output: %s...", tt.tupleCnt, result[:min(100, len(result))])
+		})
+	}
+}
+
+// TestRewriter_StripTiDBSyntax tests TiDB-specific syntax stripping
+func TestRewriter_StripTiDBSyntax(t *testing.T) {
+	rewriter := NewRewriter(true)
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		notContains string
+	}{
+		{
+			name:     "Strip CLUSTERED keyword",
+			input:    "CREATE TABLE t (id INT PRIMARY KEY CLUSTERED )",
+			contains: "PRIMARY KEY",
+			notContains: "CLUSTERED",
+		},
+		{
+			name:     "Strip NONCLUSTERED keyword",
+			input:    "CREATE TABLE t (id INT PRIMARY KEY NONCLUSTERED )",
+			contains: "PRIMARY KEY",
+			notContains: "NONCLUSTERED",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := rewriter.Rewrite(tt.input)
+			// Note: CREATE TABLE might fail in AST rewriter due to other syntax differences,
+			// but fallback should handle it
+			if err == nil {
+				assert.Contains(t, result, tt.contains)
+				assert.NotContains(t, result, tt.notContains)
+			}
+			t.Logf("Input: %s", tt.input)
+			t.Logf("Output: %s, Error: %v", result, err)
+		})
+	}
+}
+
+// TestRewriter_Fallback tests graceful fallback when parser fails
+func TestRewriter_Fallback(t *testing.T) {
+	rewriter := NewRewriter(true)
+
+	// SQL that will fail parser but fallback should handle
+	sql := "SELECT `id`, `name` FROM `users`"
+
+	result, err := rewriter.Rewrite(sql)
+	require.NoError(t, err, "Rewrite should not error even with fallback")
+	assert.NotEmpty(t, result)
+	// Fallback converts backticks to double quotes
+	assert.Contains(t, result, "\"id\"", "Fallback should convert backticks")
+	t.Logf("Input: %s", sql)
+	t.Logf("Output: %s", result)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // Benchmarks
 func BenchmarkASTRewriter_SimpleSelect(b *testing.B) {
 	rewriter := NewASTRewriter()

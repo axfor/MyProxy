@@ -200,7 +200,6 @@ MySQL Client Receives Response
 ❌ **Not Suitable for AProxy**:
 - Heavy use of stored procedures and triggers
 - Dependency on MySQL-specific features (FULLTEXT, SPATIAL)
-- Requires MySQL replication functionality
 - Heavy use of MySQL-specific data types (ENUM, SET)
 
 </details>
@@ -215,6 +214,7 @@ MySQL Client Receives Response
 - ✅ **Error Mapping**: Maps PostgreSQL error codes to MySQL error codes
 - ✅ **SHOW/DESCRIBE Emulation**: Simulates MySQL metadata commands
 - ✅ **Connection Pooling**: Supports session affinity and pooled modes
+- ✅ **MySQL CDC (Binlog)**: Stream PostgreSQL changes as MySQL binlog events to MySQL replication clients
 - ✅ **Observability**: Prometheus metrics, structured logging, health checks
 - ✅ **High Performance**: Target 10,000+ QPS, P99 latency < 50ms
 - ✅ **Production Ready**: Docker and Kubernetes deployment support
@@ -500,6 +500,174 @@ All function conversions are handled at **AST level** for semantic correctness.
 - ✅ Indexes and constraints (PRIMARY KEY, UNIQUE, INDEX)
 - ✅ LastInsertId() support (via RETURNING clause)
 
+## CDC (Change Data Capture)
+
+AProxy supports streaming PostgreSQL changes as MySQL binlog events, enabling MySQL replication clients (like Canal, Debezium, go-mysql) to subscribe to PostgreSQL data changes.
+
+### CDC Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    MySQL Replication Clients                            │
+│           (Canal / Debezium / go-mysql / Custom Clients)                │
+└────────────────────────────┬────────────────────────────────────────────┘
+                             │ MySQL Binlog Protocol (COM_BINLOG_DUMP)
+                             │
+┌────────────────────────────▼────────────────────────────────────────────┐
+│                         AProxy CDC Server                               │
+│ ┌─────────────────────────────────────────────────────────────────────┐ │
+│ │  Binlog Encoder (pkg/replication/binlog_encoder.go)                 │ │
+│ │  - TableMapEvent encoding (column metadata)                         │ │
+│ │  - RowsEvent encoding (INSERT/UPDATE/DELETE)                        │ │
+│ │  - QueryEvent encoding (DDL/TRUNCATE)                               │ │
+│ │  - GTIDEvent encoding (transaction tracking)                        │ │
+│ │  - DECIMAL/TIME/DATETIME binary format encoding                     │ │
+│ └────────────────────┬────────────────────────────────────────────────┘ │
+│                      │                                                   │
+│ ┌────────────────────▼────────────────────────────────────────────────┐ │
+│ │  Replication Server (pkg/replication/server.go)                     │ │
+│ │  - MySQL binlog protocol server                                     │ │
+│ │  - Multi-client support (COM_BINLOG_DUMP)                           │ │
+│ │  - GTID-based positioning                                           │ │
+│ │  - Event broadcasting to all connected clients                      │ │
+│ └────────────────────┬────────────────────────────────────────────────┘ │
+│                      │                                                   │
+│ ┌────────────────────▼────────────────────────────────────────────────┐ │
+│ │  PG Streamer (pkg/replication/pg_streamer.go)                       │ │
+│ │  - PostgreSQL logical replication (pglogrepl)                       │ │
+│ │  - Automatic REPLICA IDENTITY FULL setting                          │ │
+│ │  - LSN checkpoint persistence (atomic file writes)                  │ │
+│ │  - Auto-reconnect with exponential backoff                          │ │
+│ │  - TOAST unchanged column handling                                   │ │
+│ │  - 30+ PostgreSQL type mappings                                     │ │
+│ └────────────────────┬────────────────────────────────────────────────┘ │
+│                      │ PostgreSQL Logical Replication                   │
+└──────────────────────┼──────────────────────────────────────────────────┘
+                       │
+┌──────────────────────▼──────────────────────────────────────────────────┐
+│                   PostgreSQL Database                                    │
+│  - Logical replication slot (pgoutput plugin)                            │
+│  - Publication for table filtering                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### CDC Event Flow
+
+```
+PostgreSQL WAL Change
+        │
+        ▼
+┌──────────────────┐
+│ 1. PG Streamer   │  Receive logical replication message
+│    (pglogrepl)   │  Parse: INSERT/UPDATE/DELETE/TRUNCATE
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 2. Type Convert  │  PostgreSQL types → MySQL types
+│                  │  (int4→INT, text→VARCHAR, etc.)
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 3. Binlog Encode │  Create MySQL binlog events:
+│                  │  - GTIDEvent (transaction ID)
+│                  │  - TableMapEvent (schema)
+│                  │  - WriteRowsEvent / UpdateRowsEvent / DeleteRowsEvent
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ 4. Broadcast     │  Send to all connected
+│                  │  MySQL replication clients
+└──────────────────┘
+```
+
+### CDC Configuration
+
+Add the following to `configs/config.yaml`:
+
+```yaml
+cdc:
+  enabled: true                              # Enable CDC server
+  server_id: 1                               # MySQL server ID for replication
+
+  # PostgreSQL connection for logical replication
+  pg_host: "localhost"
+  pg_port: 5432
+  pg_database: "mydb"
+  pg_user: "postgres"
+  pg_password: "password"
+  pg_slot_name: "aproxy_cdc"                 # Replication slot name
+  pg_publication_name: "aproxy_pub"          # Publication name
+
+  # Checkpoint persistence for crash recovery
+  checkpoint_file: "./data/cdc_checkpoint.json"
+  checkpoint_interval: 10s
+
+  # Auto-reconnect on connection loss
+  reconnect_enabled: true
+  reconnect_max_retries: 0                   # 0 = unlimited
+  reconnect_initial_wait: 1s
+  reconnect_max_wait: 30s                    # Exponential backoff cap
+
+  # Backpressure handling
+  backpressure_timeout: 30m                  # Max wait when channel full
+```
+
+### PostgreSQL Setup
+
+```sql
+-- 1. Create publication for tables you want to replicate
+CREATE PUBLICATION aproxy_pub FOR ALL TABLES;
+
+-- Or for specific tables:
+CREATE PUBLICATION aproxy_pub FOR TABLE users, orders, products;
+
+-- 2. Create replication slot (optional, AProxy creates automatically)
+SELECT pg_create_logical_replication_slot('aproxy_cdc', 'pgoutput');
+```
+
+### Usage with Canal
+
+```go
+import "github.com/go-mysql-org/go-mysql/canal"
+
+cfg := canal.NewDefaultConfig()
+cfg.Addr = "127.0.0.1:3306"
+cfg.User = "root"
+cfg.Flavor = "mysql"
+
+c, _ := canal.NewCanal(cfg)
+c.SetEventHandler(&MyEventHandler{})
+c.Run()
+```
+
+### CDC Metrics
+
+CDC exposes the following Prometheus metrics:
+
+| Metric | Description |
+|--------|-------------|
+| `mysql_pg_proxy_cdc_events_total` | Total events by type (insert/update/delete/truncate) |
+| `mysql_pg_proxy_cdc_replication_lag_ms` | Current replication lag in milliseconds |
+| `mysql_pg_proxy_cdc_backpressure_total` | Backpressure events (channel full) |
+| `mysql_pg_proxy_cdc_connected_clients` | Connected binlog dump clients |
+| `mysql_pg_proxy_cdc_last_lsn` | Last processed PostgreSQL LSN |
+| `mysql_pg_proxy_cdc_reconnects_total` | PostgreSQL reconnection attempts |
+| `mysql_pg_proxy_cdc_events_dropped_total` | Events dropped due to timeout |
+
+### Supported CDC Features
+
+- ✅ **DML Events**: INSERT, UPDATE, DELETE with full row data
+- ✅ **DDL Events**: TRUNCATE TABLE
+- ✅ **GTID Support**: Transaction tracking with MySQL GTID format
+- ✅ **Multi-client**: Multiple replication clients simultaneously
+- ✅ **Crash Recovery**: LSN checkpoint persistence
+- ✅ **Auto-reconnect**: Exponential backoff on connection loss
+- ✅ **Type Mapping**: 30+ PostgreSQL to MySQL type conversions
+- ✅ **TOAST Handling**: Unchanged large column support
+
 ## Monitoring
 
 ### Prometheus Metrics
@@ -682,8 +850,8 @@ The following MySQL features are not supported in PostgreSQL or require rewritin
 - SPATIAL indexes (use PostGIS instead)
 
 #### Replication and High Availability
-- Binary Log
-- GTID (Global Transaction ID)
+- ~~Binary Log~~ → ✅ Supported via CDC (PostgreSQL logical replication → MySQL binlog)
+- ~~GTID (Global Transaction ID)~~ → ✅ Supported via CDC
 - Master-Slave replication commands (CHANGE MASTER TO, START/STOP SLAVE)
 
 #### Data Types
@@ -714,7 +882,7 @@ For a detailed list of unsupported features and alternatives, see [PG_UNSUPPORTE
 ### Unsupportable Features
 
 1. **Storage Engine Specific**: MyISAM/InnoDB specific behaviors
-2. **Replication**: Binary logs, GTID, master-slave replication commands
+2. **Replication**: ~~Binary logs, GTID~~ ✅ Now supported via CDC; master-slave admin commands still unsupported
 3. **MySQL-Specific Syntax**: Some stored procedures, triggers, event syntax
 
 ### Features Requiring Migration
@@ -742,17 +910,20 @@ For a detailed list of limitations, see [DESIGN.md](docs/DESIGN.md)
 
 ## Configuration Options
 
-| Option                           | Description                | Default          |
-| -------------------------------- | -------------------------- | ---------------- |
-| `server.port`                    | MySQL listen port          | 3306             |
-| `server.max_connections`         | Max connections            | 1000             |
-| `postgres.connection_mode`       | Connection mode            | session_affinity |
-| `sql_rewrite.enabled`            | Enable SQL rewrite         | true             |
-| `schema_cache.enabled`           | Enable global schema cache | true             |
-| `schema_cache.ttl`               | Cache TTL                  | 5m               |
-| `schema_cache.max_entries`       | Max cache entries          | 100000           |
-| `schema_cache.invalidate_on_ddl` | Auto-invalidate on DDL     | true             |
-| `observability.log_level`        | Log level                  | info             |
+| Option                           | Description                     | Default                        |
+| -------------------------------- | ------------------------------- | ------------------------------ |
+| `server.port`                    | MySQL listen port               | 3306                           |
+| `server.max_connections`         | Max connections                 | 1000                           |
+| `postgres.connection_mode`       | Connection mode                 | session_affinity               |
+| `sql_rewrite.enabled`            | Enable SQL rewrite              | true                           |
+| `schema_cache.enabled`           | Enable global schema cache      | true                           |
+| `schema_cache.ttl`               | Cache TTL                       | 5m                             |
+| `schema_cache.max_entries`       | Max cache entries               | 100000                         |
+| `schema_cache.invalidate_on_ddl` | Auto-invalidate on DDL          | true                           |
+| `cdc.enabled`                    | Enable CDC server               | false                          |
+| `cdc.checkpoint_file`            | LSN checkpoint file             | ./data/cdc_checkpoint.json     |
+| `cdc.reconnect_enabled`          | Auto-reconnect on connection loss | true                         |
+| `observability.log_level`        | Log level                       | info                           |
 
 For complete configuration options, see [config.yaml](configs/config.yaml)
 

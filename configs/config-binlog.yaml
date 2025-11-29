@@ -1,0 +1,62 @@
+server:
+  host: "0.0.0.0"
+  port: 3306
+  max_connections: 1000
+  max_packet_size: 16777216 # 16MB
+  read_timeout: 90s
+  write_timeout: 90s
+
+postgres:
+  host: "localhost"
+  port: 5432
+  database: "test"
+  user: "bast"
+  password: ""
+  max_pool_size: 200
+  connection_mode: "session_affinity" # session_affinity, pooled, or hybrid
+  ssl_mode: "disable" # disable, allow, prefer, require
+
+auth:
+  mode: "pass_through" # pass_through or proxy_auth
+  allowed_users: []
+
+security:
+  rate_limit_per_second: 1000
+  max_connections_per_ip: 10
+  enable_tls: false
+  tls_cert: ""
+  tls_key: ""
+  dangerous_commands_blacklist: []  # Empty - allow binlog dump
+
+sql_rewrite:
+  enabled: true
+  custom_rules: ""
+  debug_sql: true
+
+observability:
+  metrics_port: 9091
+  log_level: "debug" # debug for testing
+  log_format: "console"
+  enable_query_log: false
+  redact_parameters: false
+  enable_tracing: false
+  tracing_endpoint: "localhost:4318"
+
+schema_cache:
+  enabled: true
+  ttl: 5m
+  max_entries: 100000
+  invalidate_on_ddl: true
+
+binlog:
+  enabled: true  # Enable MySQL binlog replication
+  dir: "./data/binlog"
+  max_file_size: 104857600
+  max_files: 10
+  sync_mode: "async"
+  format: "json"
+  flush_interval: 1s
+  buffer_size: 65536
+  log_ddl: true
+  log_dml: true
+  log_select: false

@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"aproxy/internal/pool"
 	"aproxy/pkg/mapper"
 	"aproxy/pkg/observability"
+	"aproxy/pkg/replication"
+	"aproxy/pkg/reqtrack"
 	"aproxy/pkg/schema"
 	"aproxy/pkg/session"
 	"aproxy/pkg/sqlrewrite"
@@ -30,6 +33,7 @@ type Handler struct {
 	metrics      *observability.Metrics
 	logger       *observability.Logger
 	debugSQL     bool
+	replServer   *replication.Server // MySQL binlog replication server
 }
 
 func NewHandler(
@@ -39,6 +43,7 @@ func NewHandler(
 	metrics *observability.Metrics,
 	logger *observability.Logger,
 	debugSQL bool,
+	replServer *replication.Server,
 ) *Handler {
 	return &Handler{
 		pgPool:       pgPool,
@@ -50,7 +55,13 @@ func NewHandler(
 		metrics:      metrics,
 		logger:       logger,
 		debugSQL:     debugSQL,
+		replServer:   replServer,
 	}
+}
+
+// SetReplicationServer sets the replication server for handling COM_BINLOG_DUMP
+func (h *Handler) SetReplicationServer(server *replication.Server) {
+	h.replServer = server
 }
 
 func (h *Handler) NewConnection(conn net.Conn) (server.Handler, error) {
@@ -90,6 +101,10 @@ func (ch *ConnectionHandler) UseDB(dbName string) error {
 func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
 	startTime := time.Now()
 	ch.handler.metrics.IncTotalQueries()
+
+	// Track request for monitoring slow queries
+	reqID := reqtrack.GetTracker().StartRequest(ch.session.ID, query)
+	defer reqtrack.GetTracker().EndRequest(reqID)
 
 	ctx := context.Background()
 
@@ -143,6 +158,16 @@ func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
 			ch.handler.logger.LogError(ch.session.ID, ch.session.User, ch.session.ClientAddr, "rollback_transaction", err)
 			return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, err.Error())
 		}
+		ch.handler.logger.LogQuery(ch.session.ID, ch.session.User, ch.session.ClientAddr, query, time.Since(startTime).Seconds(), 0, nil)
+		return &mysql.Result{Status: 0}, nil
+	}
+
+	// Handle KILL command - MySQL clients send this to terminate connections
+	// PostgreSQL doesn't support KILL, so we just return OK
+	if isKillStatement(query) {
+		ch.handler.logger.Info("KILL command received (ignored)",
+			zap.String("session_id", ch.session.ID),
+			zap.String("query", query))
 		ch.handler.logger.LogQuery(ch.session.ID, ch.session.User, ch.session.ClientAddr, query, time.Since(startTime).Seconds(), 0, nil)
 		return &mysql.Result{Status: 0}, nil
 	}
@@ -586,9 +611,83 @@ func (ch *ConnectionHandler) HandleOtherCommand(cmd byte, data []byte) error {
 		return ch.UseDB(string(data))
 	case mysql.COM_QUIT:
 		return ch.Close()
+	case mysql.COM_BINLOG_DUMP:
+		return ch.handleBinlogDump(data)
+	case mysql.COM_BINLOG_DUMP_GTID:
+		return ch.handleBinlogDumpGTID(data)
+	case mysql.COM_REGISTER_SLAVE:
+		return ch.handleRegisterSlave(data)
 	default:
 		return mysql.NewError(mysql.ER_UNKNOWN_COM_ERROR, fmt.Sprintf("command %d not supported", cmd))
 	}
+}
+
+// handleBinlogDump handles COM_BINLOG_DUMP command from MySQL replication clients
+// Protocol: https://dev.mysql.com/doc/internals/en/com-binlog-dump.html
+// Format: [4 bytes pos][2 bytes flags][4 bytes server-id][string filename]
+func (ch *ConnectionHandler) handleBinlogDump(data []byte) error {
+	if ch.handler.replServer == nil {
+		return mysql.NewError(mysql.ER_MASTER_FATAL_ERROR_READING_BINLOG, "binlog replication not enabled")
+	}
+
+	if len(data) < 10 {
+		return mysql.NewError(mysql.ER_MALFORMED_PACKET, "invalid COM_BINLOG_DUMP packet")
+	}
+
+	// Parse COM_BINLOG_DUMP packet
+	pos := binary.LittleEndian.Uint32(data[0:4])
+	// flags := binary.LittleEndian.Uint16(data[4:6])  // Not used currently
+	serverID := binary.LittleEndian.Uint32(data[6:10])
+	filename := string(data[10:])
+
+	ch.handler.logger.Info("COM_BINLOG_DUMP received",
+		zap.Uint32("position", pos),
+		zap.Uint32("server_id", serverID),
+		zap.String("filename", filename))
+
+	// Create mysql.Position for the replication server
+	position := mysql.Position{
+		Name: filename,
+		Pos:  pos,
+	}
+
+	// Delegate to replication server
+	// This is a blocking call that streams events to the client
+	return ch.handler.replServer.HandleBinlogDump(ch.conn, serverID, position)
+}
+
+// handleBinlogDumpGTID handles COM_BINLOG_DUMP_GTID command
+// Protocol: https://dev.mysql.com/doc/internals/en/com-binlog-dump-gtid.html
+func (ch *ConnectionHandler) handleBinlogDumpGTID(data []byte) error {
+	if ch.handler.replServer == nil {
+		return mysql.NewError(mysql.ER_MASTER_FATAL_ERROR_READING_BINLOG, "binlog replication not enabled")
+	}
+
+	// For now, we don't support GTID-based replication
+	// Just return an error asking client to use file-based replication
+	ch.handler.logger.Warn("COM_BINLOG_DUMP_GTID not supported, use file-based replication")
+	return mysql.NewError(mysql.ER_MASTER_FATAL_ERROR_READING_BINLOG,
+		"GTID-based replication not supported, please use file-based replication")
+}
+
+// handleRegisterSlave handles COM_REGISTER_SLAVE command
+// This is sent by MySQL slaves before they start replication
+func (ch *ConnectionHandler) handleRegisterSlave(data []byte) error {
+	if ch.handler.replServer == nil {
+		return mysql.NewError(mysql.ER_MASTER_FATAL_ERROR_READING_BINLOG, "binlog replication not enabled")
+	}
+
+	// Parse server ID from the packet (first 4 bytes)
+	if len(data) < 4 {
+		return mysql.NewError(mysql.ER_MALFORMED_PACKET, "invalid COM_REGISTER_SLAVE packet")
+	}
+
+	serverID := binary.LittleEndian.Uint32(data[0:4])
+	ch.handler.logger.Info("COM_REGISTER_SLAVE received", zap.Uint32("server_id", serverID))
+
+	// Just acknowledge the registration
+	// The actual replication will start when COM_BINLOG_DUMP is received
+	return nil
 }
 
 func (ch *ConnectionHandler) Close() error {
@@ -884,6 +983,15 @@ func (ch *ConnectionHandler) handleUseCommand(ctx context.Context, query string)
 	}
 
 	return result, nil
+}
+
+// isKillStatement checks if the query is a MySQL KILL command
+// MySQL clients send KILL <id> to terminate connections, but PostgreSQL doesn't support this.
+// We intercept and return OK to avoid errors on graceful client disconnect.
+func isKillStatement(query string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	// Match KILL <id>, KILL CONNECTION <id>, KILL QUERY <id>
+	return strings.HasPrefix(upper, "KILL ")
 }
 
 // extractInsertTableName extracts the table name from an INSERT statement

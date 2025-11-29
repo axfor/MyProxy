@@ -2,7 +2,7 @@ package sqlrewrite
 
 import (
 	"fmt"
-	"os"
+	"strings"
 
 	"github.com/pingcap/tidb/pkg/parser"
 )
@@ -28,10 +28,21 @@ func NewASTRewriter() *ASTRewriter {
 
 // Rewrite rewrites MySQL SQL to PostgreSQL SQL
 // This is the main public API
-func (r *ASTRewriter) Rewrite(sql string) (string, error) {
+func (r *ASTRewriter) Rewrite(sql string) (result string, retErr error) {
+	// Recover from panics in TiDB parser (parser has bugs with extreme placeholder patterns)
+	defer func() {
+		if rec := recover(); rec != nil {
+			retErr = fmt.Errorf("parser panic: %v", rec)
+		}
+	}()
+
 	if !r.enabled {
 		return sql, nil
 	}
+
+	// Step 0: Pre-process - remove MySQL charset prefixes BEFORE parsing
+	// This dramatically improves TiDB parser performance for SQL with many _UTF8MB4 prefixes
+	sql = r.preProcessCharsetPrefixes(sql)
 
 	// Step 1: Parse MySQL SQL to AST
 	stmts, _, err := r.parser.Parse(sql, "", "")
@@ -64,13 +75,7 @@ func (r *ASTRewriter) Rewrite(sql string) (string, error) {
 	}
 
 	// Step 4: Post-processing
-	pgSQLBeforePost := pgSQL
 	pgSQL = r.generator.PostProcess(pgSQL)
-
-	// DEBUG: Log post-process changes
-	if pgSQL != pgSQLBeforePost {
-		fmt.Fprintf(os.Stderr, "PostProcess changed SQL: %q -> %q\n", pgSQLBeforePost, pgSQL)
-	}
 
 	// Record placeholder count (for debugging)
 	_ = paramCount
@@ -106,4 +111,62 @@ func (r *ASTRewriter) Disable() {
 // IsEnabled checks if the AST rewriter is enabled
 func (r *ASTRewriter) IsEnabled() bool {
 	return r.enabled
+}
+
+// preProcessCharsetPrefixes removes MySQL charset prefixes before AST parsing
+// This dramatically improves parser performance for SQL with many _UTF8MB4 prefixes
+// MySQL: _UTF8MB4'text', _UTF8'text', _LATIN1'text'
+// Result: 'text'
+func (r *ASTRewriter) preProcessCharsetPrefixes(sql string) string {
+	// Quick check: if no underscore, nothing to do
+	if !strings.Contains(sql, "_") {
+		return sql
+	}
+
+	var result strings.Builder
+	result.Grow(len(sql))
+
+	i := 0
+	for i < len(sql) {
+		// Look for underscore that might start a charset prefix
+		if sql[i] == '_' && i+2 < len(sql) {
+			// Check if this is a charset prefix followed by quote
+			prefixLen := r.matchCharsetPrefix(sql[i:])
+			if prefixLen > 0 {
+				// Skip the charset prefix, keep the quote
+				i += prefixLen
+				continue
+			}
+		}
+		result.WriteByte(sql[i])
+		i++
+	}
+
+	return result.String()
+}
+
+// matchCharsetPrefix checks if the string starts with a charset prefix followed by a quote
+// Returns the length of the prefix (not including the quote) if matched, 0 otherwise
+func (r *ASTRewriter) matchCharsetPrefix(s string) int {
+	// Charset prefixes in order of most common first for TPC-C workload
+	prefixes := []string{
+		"_UTF8MB4", "_utf8mb4",
+		"_UTF8", "_utf8",
+		"_BINARY", "_binary",
+		"_LATIN1", "_latin1",
+		"_ASCII", "_ascii",
+		"_UCS2", "_ucs2",
+		"_UTF16", "_utf16",
+		"_UTF32", "_utf32",
+	}
+
+	for _, prefix := range prefixes {
+		if len(s) > len(prefix) && strings.HasPrefix(s, prefix) {
+			nextChar := s[len(prefix)]
+			if nextChar == '\'' || nextChar == '"' {
+				return len(prefix)
+			}
+		}
+	}
+	return 0
 }

@@ -25,7 +25,8 @@ func (se *ShowEmulator) HandleShowCommand(ctx context.Context, conn *pgx.Conn, s
 		return se.showTables(ctx, conn, sql)
 	}
 
-	if strings.HasPrefix(upperSQL, "SHOW COLUMNS") || strings.HasPrefix(upperSQL, "SHOW FIELDS") {
+	if strings.HasPrefix(upperSQL, "SHOW COLUMNS") || strings.HasPrefix(upperSQL, "SHOW FIELDS") ||
+		strings.HasPrefix(upperSQL, "SHOW FULL COLUMNS") || strings.HasPrefix(upperSQL, "SHOW FULL FIELDS") {
 		return se.showColumns(ctx, conn, sql)
 	}
 
@@ -47,6 +48,10 @@ func (se *ShowEmulator) HandleShowCommand(ctx context.Context, conn *pgx.Conn, s
 
 	if strings.HasPrefix(upperSQL, "SHOW VARIABLES") {
 		return se.showVariables(ctx, conn, sql)
+	}
+
+	if strings.HasPrefix(upperSQL, "SHOW GLOBAL VARIABLES") {
+		return se.showGlobalVariables(ctx, conn, sql)
 	}
 
 	if strings.HasPrefix(upperSQL, "SHOW WARNINGS") {
@@ -106,19 +111,104 @@ func (se *ShowEmulator) showColumns(ctx context.Context, conn *pgx.Conn, sql str
 		return nil, fmt.Errorf("table name not found in: %s", sql)
 	}
 
-	query := fmt.Sprintf(`
-		SELECT
-			column_name AS "Field",
-			data_type AS "Type",
-			is_nullable AS "Null",
-			column_default AS "Default",
-			'' AS "Key",
-			'' AS "Extra"
-		FROM information_schema.columns
-		WHERE table_schema = current_schema()
-		  AND table_name = '%s'
-		ORDER BY ordinal_position
-	`, tableName)
+	// Clean backticks from the full table name (handles `schema`.`table` format)
+	tableName = strings.ReplaceAll(tableName, "`", "")
+
+	// Handle schema.table format (e.g., public.users)
+	schemaName := "current_schema()"
+	if strings.Contains(tableName, ".") {
+		parts := strings.SplitN(tableName, ".", 2)
+		schemaName = fmt.Sprintf("'%s'", parts[0])
+		tableName = parts[1]
+	}
+
+	// Check if this is SHOW FULL COLUMNS (needs additional fields)
+	upperSQL := strings.ToUpper(sql)
+	isFullColumns := strings.Contains(upperSQL, "FULL")
+
+	var query string
+	if isFullColumns {
+		// SHOW FULL COLUMNS returns additional fields: Collation, Privileges, Comment
+		// Map PostgreSQL types to MySQL types for compatibility with tools like go-mysql/canal
+		query = fmt.Sprintf(`
+			SELECT
+				column_name AS "Field",
+				CASE
+					WHEN data_type = 'integer' THEN 'int(11)'
+					WHEN data_type = 'smallint' THEN 'smallint(6)'
+					WHEN data_type = 'bigint' THEN 'bigint(20)'
+					WHEN data_type = 'serial' THEN 'int(11)'
+					WHEN data_type = 'bigserial' THEN 'bigint(20)'
+					WHEN data_type = 'character varying' THEN 'varchar(' || COALESCE(character_maximum_length::text, '255') || ')'
+					WHEN data_type = 'character' THEN 'char(' || COALESCE(character_maximum_length::text, '1') || ')'
+					WHEN data_type = 'text' THEN 'text'
+					WHEN data_type = 'boolean' THEN 'tinyint(1)'
+					WHEN data_type = 'numeric' THEN 'decimal(' || COALESCE(numeric_precision::text, '10') || ',' || COALESCE(numeric_scale::text, '0') || ')'
+					WHEN data_type = 'real' THEN 'float'
+					WHEN data_type = 'double precision' THEN 'double'
+					WHEN data_type = 'date' THEN 'date'
+					WHEN data_type = 'time without time zone' THEN 'time'
+					WHEN data_type = 'time with time zone' THEN 'time'
+					WHEN data_type = 'timestamp without time zone' THEN 'datetime'
+					WHEN data_type = 'timestamp with time zone' THEN 'timestamp'
+					WHEN data_type = 'bytea' THEN 'blob'
+					WHEN data_type = 'json' THEN 'json'
+					WHEN data_type = 'jsonb' THEN 'json'
+					WHEN data_type = 'uuid' THEN 'char(36)'
+					ELSE data_type
+				END AS "Type",
+				COALESCE(collation_name, '') AS "Collation",
+				CASE WHEN is_nullable = 'YES' THEN 'YES' ELSE 'NO' END AS "Null",
+				CASE
+					WHEN EXISTS (
+						SELECT 1 FROM information_schema.table_constraints tc
+						JOIN information_schema.key_column_usage kcu
+						ON tc.constraint_name = kcu.constraint_name
+						AND tc.table_schema = kcu.table_schema
+						WHERE tc.constraint_type = 'PRIMARY KEY'
+						AND kcu.table_schema = %s
+						AND kcu.table_name = '%s'
+						AND kcu.column_name = c.column_name
+					) THEN 'PRI'
+					ELSE ''
+				END AS "Key",
+				COALESCE(column_default, '') AS "Default",
+				CASE
+					WHEN column_default LIKE 'nextval%%' THEN 'auto_increment'
+					ELSE ''
+				END AS "Extra",
+				'select,insert,update,references' AS "Privileges",
+				'' AS "Comment"
+			FROM information_schema.columns c
+			WHERE table_schema = %s
+			  AND table_name = '%s'
+			ORDER BY ordinal_position
+		`, schemaName, tableName, schemaName, tableName)
+	} else {
+		query = fmt.Sprintf(`
+			SELECT
+				column_name AS "Field",
+				CASE
+					WHEN data_type = 'integer' THEN 'int(11)'
+					WHEN data_type = 'smallint' THEN 'smallint(6)'
+					WHEN data_type = 'bigint' THEN 'bigint(20)'
+					WHEN data_type = 'character varying' THEN 'varchar(' || COALESCE(character_maximum_length::text, '255') || ')'
+					WHEN data_type = 'character' THEN 'char(' || COALESCE(character_maximum_length::text, '1') || ')'
+					WHEN data_type = 'text' THEN 'text'
+					WHEN data_type = 'boolean' THEN 'tinyint(1)'
+					WHEN data_type = 'numeric' THEN 'decimal(' || COALESCE(numeric_precision::text, '10') || ',' || COALESCE(numeric_scale::text, '0') || ')'
+					ELSE data_type
+				END AS "Type",
+				CASE WHEN is_nullable = 'YES' THEN 'YES' ELSE 'NO' END AS "Null",
+				COALESCE(column_default, '') AS "Default",
+				'' AS "Key",
+				'' AS "Extra"
+			FROM information_schema.columns
+			WHERE table_schema = %s
+			  AND table_name = '%s'
+			ORDER BY ordinal_position
+		`, schemaName, tableName)
+	}
 
 	return conn.Query(ctx, query)
 }
@@ -182,24 +272,47 @@ func (se *ShowEmulator) showIndex(ctx context.Context, conn *pgx.Conn, sql strin
 		return nil, fmt.Errorf("table name not found in: %s", sql)
 	}
 
+	// Clean backticks from the full table name (handles `schema`.`table` format)
+	tableName = strings.ReplaceAll(tableName, "`", "")
+
+	// Handle schema.table format
+	schemaName := "current_schema()"
+	if strings.Contains(tableName, ".") {
+		parts := strings.SplitN(tableName, ".", 2)
+		schemaName = fmt.Sprintf("'%s'", parts[0])
+		tableName = parts[1]
+	}
+
+	// Return MySQL-compatible SHOW INDEX output with proper column information
+	// This includes PRIMARY KEY and other indexes
+	// Map PostgreSQL primary key index (_pkey suffix) to MySQL's PRIMARY
 	query := fmt.Sprintf(`
 		SELECT
 			'%s' AS "Table",
-			0 AS "Non_unique",
-			i.indexname AS "Key_name",
-			1 AS "Seq_in_index",
-			'' AS "Column_name",
+			CASE WHEN i.indisunique THEN 0 ELSE 1 END AS "Non_unique",
+			CASE WHEN i.indisprimary THEN 'PRIMARY' ELSE ic.relname END AS "Key_name",
+			a.attnum AS "Seq_in_index",
+			a.attname AS "Column_name",
 			'A' AS "Collation",
-			0 AS "Cardinality",
+			0::bigint AS "Cardinality",
 			NULL AS "Sub_part",
 			NULL AS "Packed",
-			'YES' AS "Null",
+			CASE WHEN a.attnotnull THEN '' ELSE 'YES' END AS "Null",
 			'BTREE' AS "Index_type",
-			'' AS "Comment"
-		FROM pg_indexes i
-		WHERE i.schemaname = current_schema()
-		  AND i.tablename = '%s'
-	`, tableName, tableName)
+			'' AS "Comment",
+			'' AS "Index_comment",
+			'YES' AS "Visible"
+		FROM pg_index i
+		JOIN pg_class t ON t.oid = i.indrelid
+		JOIN pg_class ic ON ic.oid = i.indexrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)
+		WHERE n.nspname = %s
+		  AND t.relname = '%s'
+		ORDER BY
+			CASE WHEN i.indisprimary THEN 0 ELSE 1 END,
+			ic.relname, a.attnum
+	`, tableName, schemaName, tableName)
 
 	return conn.Query(ctx, query)
 }
@@ -339,4 +452,53 @@ func (se *ShowEmulator) HandleUseCommand(ctx context.Context, conn *pgx.Conn, sq
 
 	_, err := conn.Exec(ctx, fmt.Sprintf("SET search_path TO %s", dbName))
 	return err
+}
+
+// showGlobalVariables handles SHOW GLOBAL VARIABLES queries
+// This is needed for MySQL replication clients like go-mysql/canal
+func (se *ShowEmulator) showGlobalVariables(ctx context.Context, conn *pgx.Conn, sql string) (pgx.Rows, error) {
+	upperSQL := strings.ToUpper(sql)
+
+	// Handle LIKE patterns for specific variables
+	if strings.Contains(upperSQL, "LIKE") {
+		parts := strings.Split(upperSQL, "LIKE")
+		if len(parts) > 1 {
+			pattern := strings.TrimSpace(parts[1])
+			pattern = strings.Trim(pattern, "'\"")
+			pattern = strings.ToLower(pattern)
+			pattern = strings.ReplaceAll(pattern, "%", "")
+
+			// Return MySQL-compatible values for binlog replication
+			switch pattern {
+			case "binlog_format":
+				return conn.Query(ctx, `SELECT 'binlog_format' AS "Variable_name", 'ROW' AS "Value"`)
+			case "binlog_row_image":
+				return conn.Query(ctx, `SELECT 'binlog_row_image' AS "Variable_name", 'FULL' AS "Value"`)
+			case "server_id":
+				return conn.Query(ctx, `SELECT 'server_id' AS "Variable_name", '1' AS "Value"`)
+			case "server_uuid":
+				return conn.Query(ctx, `SELECT 'server_uuid' AS "Variable_name", '38db14f0-9bcc-487a-8001-9bcc38db18d8' AS "Value"`)
+			case "gtid_mode":
+				return conn.Query(ctx, `SELECT 'gtid_mode' AS "Variable_name", 'OFF' AS "Value"`)
+			case "log_bin":
+				return conn.Query(ctx, `SELECT 'log_bin' AS "Variable_name", 'ON' AS "Value"`)
+			case "binlog_checksum":
+				return conn.Query(ctx, `SELECT 'binlog_checksum' AS "Variable_name", 'CRC32' AS "Value"`)
+			}
+		}
+	}
+
+	// Default: return common MySQL global variables
+	query := `
+		SELECT 'binlog_format' AS "Variable_name", 'ROW' AS "Value"
+		UNION ALL SELECT 'binlog_row_image', 'FULL'
+		UNION ALL SELECT 'server_id', '1'
+		UNION ALL SELECT 'log_bin', 'ON'
+		UNION ALL SELECT 'gtid_mode', 'OFF'
+		UNION ALL SELECT 'binlog_checksum', 'CRC32'
+		UNION ALL SELECT 'max_allowed_packet', '67108864'
+		UNION ALL SELECT 'character_set_server', 'utf8mb4'
+		UNION ALL SELECT 'collation_server', 'utf8mb4_general_ci'
+	`
+	return conn.Query(ctx, query)
 }

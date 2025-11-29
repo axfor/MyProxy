@@ -33,14 +33,14 @@ security:
 sql_rewrite:
   enabled: true
   custom_rules: ""
-  debug_sql: false # Enable to log all SQL queries (original MySQL and converted PostgreSQL)
+  debug_sql: true # Enable to log all SQL queries (original MySQL and converted PostgreSQL)
 
 observability:
-  metrics_port: 9090
-  log_level: "info" # debug, info, warn, error
+  metrics_port: 9091
+  log_level: "debug" # debug, info, warn, error
   log_format: "json" # json or console
-  enable_query_log: false
-  redact_parameters: true
+  enable_query_log: true
+  redact_parameters: false
   enable_tracing: false
   tracing_endpoint: "localhost:4318"
 
@@ -49,3 +49,31 @@ schema_cache:
   ttl: 5m # Cache TTL for table schema information
   max_entries: 100000
   invalidate_on_ddl: true # Automatically invalidate cache on CREATE/ALTER/DROP TABLE
+
+binlog:
+  enabled: true # Enable MySQL-like binary logging
+  dir: "./data/binlog" # Directory for binlog files
+  max_file_size: 104857600 # 100MB - rotate when file exceeds this size
+  max_files: 10 # Keep at most this many binlog files
+  sync_mode: "async" # async, sync, or fsync
+  format: "json" # json or binary
+  flush_interval: 1s # Flush buffer to disk interval
+  buffer_size: 65536 # 64KB write buffer
+  log_ddl: true # Log DDL statements (CREATE, ALTER, DROP)
+  log_dml: true # Log DML statements (INSERT, UPDATE, DELETE)
+  log_select: false # Log SELECT statements (usually disabled)
+
+cdc:
+  enabled: false # Enable CDC (MySQL binlog protocol) server
+  server_id: 1 # MySQL server ID for replication
+  backpressure_timeout: 30m # Max wait time when event channel full (supports: 30m, 1h, 10m, etc.)
+
+  # Checkpoint persistence for recovery
+  checkpoint_file: "./data/cdc_checkpoint.json" # File to store LSN checkpoint
+  checkpoint_interval: 10s # How often to save checkpoint
+
+  # Auto-reconnect settings
+  reconnect_enabled: true # Enable auto-reconnect on connection loss
+  reconnect_max_retries: 0 # Max reconnect attempts (0 = unlimited)
+  reconnect_initial_wait: 1s # Initial wait before reconnect
+  reconnect_max_wait: 30s # Max wait between reconnects (exponential backoff)

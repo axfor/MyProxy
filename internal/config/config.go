@@ -16,6 +16,7 @@ type Config struct {
 	SQLRewrite   SQLRewriteConfig   `yaml:"sql_rewrite"`
 	Observability ObservabilityConfig `yaml:"observability"`
 	SchemaCache  SchemaCacheConfig  `yaml:"schema_cache"`
+	Binlog       BinlogConfig       `yaml:"binlog"`
 }
 
 type ServerConfig struct {
@@ -75,6 +76,20 @@ type SchemaCacheConfig struct {
 	InvalidateOnDDL  bool          `yaml:"invalidate_on_ddl"`
 }
 
+type BinlogConfig struct {
+	Enabled       bool          `yaml:"enabled"`
+	Dir           string        `yaml:"dir"`
+	MaxFileSize   int64         `yaml:"max_file_size"`
+	MaxFiles      int           `yaml:"max_files"`
+	SyncMode      string        `yaml:"sync_mode"`      // async, sync, fsync
+	Format        string        `yaml:"format"`         // json, binary
+	FlushInterval time.Duration `yaml:"flush_interval"`
+	BufferSize    int           `yaml:"buffer_size"`
+	LogDDL        bool          `yaml:"log_ddl"`
+	LogDML        bool          `yaml:"log_dml"`
+	LogSelect     bool          `yaml:"log_select"`
+}
+
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
@@ -129,6 +144,19 @@ func DefaultConfig() *Config {
 			TTL:             5 * time.Minute,
 			MaxEntries:      10000,
 			InvalidateOnDDL: true,
+		},
+		Binlog: BinlogConfig{
+			Enabled:       true,
+			Dir:           "./data/binlog",
+			MaxFileSize:   100 * 1024 * 1024, // 100MB
+			MaxFiles:      10,
+			SyncMode:      "async",
+			Format:        "json",
+			FlushInterval: 1 * time.Second,
+			BufferSize:    64 * 1024, // 64KB
+			LogDDL:        true,
+			LogDML:        true,
+			LogSelect:     false,
 		},
 	}
 }

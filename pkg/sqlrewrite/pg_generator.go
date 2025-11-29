@@ -234,6 +234,11 @@ func (g *PGGenerator) PostProcess(sql string) string {
 	// MySQL: LOCK IN SHARE MODE → PostgreSQL: FOR SHARE
 	sql = strings.ReplaceAll(sql, "LOCK IN SHARE MODE", "FOR SHARE")
 
+	// Fix implicit cross join syntax from TiDB parser
+	// TiDB outputs: FROM ("table1") JOIN "table2" WHERE ...
+	// PostgreSQL requires: FROM "table1", "table2" WHERE ... (or CROSS JOIN with explicit ON)
+	sql = g.fixImplicitCrossJoin(sql)
+
 	// Convert MySQL LAST_INSERT_ID() to PostgreSQL lastval()
 	// MySQL: LAST_INSERT_ID() → PostgreSQL: lastval()
 	sql = strings.ReplaceAll(sql, "LAST_INSERT_ID()", "lastval()")
@@ -645,28 +650,59 @@ func (g *PGGenerator) convertMatchOperator(sql string) string {
 // removeCharsetPrefixes removes MySQL character set prefixes from string literals
 // MySQL: _UTF8MB4'text', _UTF8'text', _LATIN1'text'
 // PostgreSQL: 'text'
+// Optimized: single-pass scan instead of multiple ReplaceAll calls
 func (g *PGGenerator) removeCharsetPrefixes(sql string) string {
-	result := sql
+	// Quick check: if no underscore, nothing to do
+	if !strings.Contains(sql, "_") {
+		return sql
+	}
 
-	// Common MySQL character set prefixes
-	charsets := []string{
+	var result strings.Builder
+	result.Grow(len(sql))
+
+	i := 0
+	for i < len(sql) {
+		// Look for underscore that might start a charset prefix
+		if sql[i] == '_' && i+2 < len(sql) {
+			// Check if this is a charset prefix followed by quote
+			prefixLen := g.matchCharsetPrefix(sql[i:])
+			if prefixLen > 0 {
+				// Skip the charset prefix, keep the quote
+				i += prefixLen
+				continue
+			}
+		}
+		result.WriteByte(sql[i])
+		i++
+	}
+
+	return result.String()
+}
+
+// matchCharsetPrefix checks if the string starts with a charset prefix followed by a quote
+// Returns the length of the prefix (not including the quote) if matched, 0 otherwise
+func (g *PGGenerator) matchCharsetPrefix(s string) int {
+	// Charset prefixes in order of most common first for TPC-C workload
+	prefixes := []string{
 		"_UTF8MB4", "_utf8mb4",
 		"_UTF8", "_utf8",
+		"_BINARY", "_binary",
 		"_LATIN1", "_latin1",
 		"_ASCII", "_ascii",
-		"_BINARY", "_binary",
 		"_UCS2", "_ucs2",
 		"_UTF16", "_utf16",
 		"_UTF32", "_utf32",
 	}
 
-	for _, charset := range charsets {
-		// Pattern: _CHARSET'...' or _CHARSET"..."
-		result = strings.ReplaceAll(result, charset+"'", "'")
-		result = strings.ReplaceAll(result, charset+"\"", "\"")
+	for _, prefix := range prefixes {
+		if len(s) > len(prefix) && strings.HasPrefix(s, prefix) {
+			nextChar := s[len(prefix)]
+			if nextChar == '\'' || nextChar == '"' {
+				return len(prefix)
+			}
+		}
 	}
-
-	return result
+	return 0
 }
 
 // convertAutoIncrement converts MySQL AUTO_INCREMENT to PostgreSQL SERIAL
@@ -1306,6 +1342,267 @@ func replaceDoubleType(s string) string {
 	}
 
 	return result
+}
+
+// fixImplicitCrossJoin fixes TiDB parser's incorrect output for implicit cross joins
+// TiDB outputs: FROM ("table1") JOIN "table2" WHERE ...
+// PostgreSQL requires: FROM "table1", "table2" WHERE ... (comma syntax for cross join)
+// This only fixes JOIN without ON clause (implicit cross join)
+//
+// TiDB also outputs: FROM ("table1", (SELECT ...) AS "q"), (SELECT ...) AS "no"
+// Which has outer parentheses around the first table group that need to be removed
+func (g *PGGenerator) fixImplicitCrossJoin(sql string) string {
+	result := sql
+
+	// Pattern: ) JOIN " followed by WHERE or end of FROM clause (no ON)
+	// We need to convert this back to comma syntax
+
+	// Look for patterns like: ("table") JOIN "table" WHERE
+	// and convert to: "table", "table" WHERE
+	searchPos := 0
+	for {
+		// Find FROM keyword
+		upperPart := strings.ToUpper(result[searchPos:])
+		fromIdx := strings.Index(upperPart, "FROM ")
+		if fromIdx == -1 {
+			break
+		}
+		fromIdx = searchPos + fromIdx
+
+		// Find the end of FROM clause by looking for outer-level keywords
+		// We need to skip keywords that are inside subqueries (nested parentheses)
+		fromClauseStart := fromIdx + 5 // Skip "FROM "
+		fromClauseEnd := g.findOuterClauseEnd(result, fromClauseStart)
+
+		if fromClauseEnd <= fromClauseStart {
+			searchPos = fromIdx + 5
+			continue
+		}
+
+		fromClause := result[fromClauseStart:fromClauseEnd]
+		fixedFromClause := fromClause
+
+		// Check if this FROM clause contains ) JOIN " pattern (implicit cross join)
+		// Pattern: ("table") JOIN "table" (no ON clause)
+		// Need to check for ON at outer level only
+		if strings.Contains(fromClause, ") JOIN ") && !g.hasOuterOnClause(fromClause) {
+			// Fix the pattern by replacing ) JOIN with ,
+			// Also need to remove the leading ( before the first table
+			fixedFromClause = g.fixCrossJoinInFromClause(fromClause)
+		}
+
+		// Also check for outer parentheses pattern without JOIN:
+		// ("table", (SELECT ...) AS "q"), (SELECT ...) AS "no"
+		// This pattern doesn't have ) JOIN but still has unnecessary outer parentheses
+		fixedFromClause = g.removeLeadingTableGroupParens(fixedFromClause)
+
+		if fixedFromClause != fromClause {
+			result = result[:fromClauseStart] + fixedFromClause + result[fromClauseEnd:]
+		}
+
+		searchPos = fromIdx + 5
+	}
+
+	return result
+}
+
+// findOuterClauseEnd finds the end of FROM clause by looking for outer-level keywords
+// It skips keywords inside subqueries (inside parentheses)
+func (g *PGGenerator) findOuterClauseEnd(sql string, startPos int) int {
+	parenDepth := 0
+	i := startPos
+
+	for i < len(sql) {
+		ch := sql[i]
+
+		// Track parenthesis depth
+		if ch == '(' {
+			parenDepth++
+			i++
+			continue
+		}
+		if ch == ')' {
+			parenDepth--
+			i++
+			continue
+		}
+
+		// Only check for clause keywords at outer level (parenDepth == 0)
+		if parenDepth == 0 && ch == ' ' {
+			// Check for WHERE, ORDER, GROUP, LIMIT, FOR, HAVING, UNION keywords
+			remaining := strings.ToUpper(sql[i:])
+			if strings.HasPrefix(remaining, " WHERE ") ||
+				strings.HasPrefix(remaining, " ORDER ") ||
+				strings.HasPrefix(remaining, " GROUP ") ||
+				strings.HasPrefix(remaining, " LIMIT ") ||
+				strings.HasPrefix(remaining, " FOR ") ||
+				strings.HasPrefix(remaining, " HAVING ") ||
+				strings.HasPrefix(remaining, " UNION ") {
+				return i
+			}
+		}
+
+		i++
+	}
+
+	return len(sql)
+}
+
+// hasOuterOnClause checks if the FROM clause has an ON clause at outer level
+// This is used to distinguish implicit cross joins from explicit joins
+func (g *PGGenerator) hasOuterOnClause(fromClause string) bool {
+	parenDepth := 0
+
+	for i := 0; i < len(fromClause); i++ {
+		ch := fromClause[i]
+
+		if ch == '(' {
+			parenDepth++
+			continue
+		}
+		if ch == ')' {
+			parenDepth--
+			continue
+		}
+
+		// Only check for ON at outer level
+		if parenDepth == 0 && ch == ' ' && i+4 < len(fromClause) {
+			remaining := strings.ToUpper(fromClause[i:])
+			if strings.HasPrefix(remaining, " ON ") {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// fixCrossJoinInFromClause fixes the FROM clause content
+// Input:  ("orders") JOIN "order_line"
+// Output: "orders", "order_line"
+// Also handles complex cases like:
+// Input:  ("district" AS "dis", (SELECT ...) AS "q") JOIN (SELECT ...) AS "no"
+// Output: "district" AS "dis", (SELECT ...) AS "q", (SELECT ...) AS "no"
+func (g *PGGenerator) fixCrossJoinInFromClause(fromClause string) string {
+	result := fromClause
+
+	// Handle multiple JOINs iteratively
+	for {
+		// Find ) JOIN pattern (note: might be followed by ( for subquery)
+		joinIdx := strings.Index(result, ") JOIN ")
+		if joinIdx == -1 {
+			break
+		}
+
+		// Replace ) JOIN with ), (comma with closing paren kept)
+		result = result[:joinIdx+1] + "," + result[joinIdx+6:]
+	}
+
+	// Remove leading outer parentheses if they wrap a table group (not a subquery)
+	// Pattern: ("table", (SELECT ...)) -> "table", (SELECT ...)
+	result = g.removeLeadingTableGroupParens(result)
+
+	// Now remove simple unnecessary parentheses around single table names
+	// Pattern: ("table") -> "table"
+	result = g.removeTableParentheses(result)
+
+	return result
+}
+
+// removeLeadingTableGroupParens removes outer parentheses at the start of FROM clause
+// that wrap a table group (table + subqueries), but not subqueries themselves
+// Input:  ("district" AS "dis", (SELECT ...) AS "q"), (SELECT ...) AS "no"
+// Output: "district" AS "dis", (SELECT ...) AS "q", (SELECT ...) AS "no"
+func (g *PGGenerator) removeLeadingTableGroupParens(s string) string {
+	result := strings.TrimSpace(s)
+
+	for {
+		if len(result) == 0 || result[0] != '(' {
+			break
+		}
+
+		// Check if this is a subquery (starts with SELECT)
+		content := strings.TrimSpace(result[1:])
+		if g.startsWithSelect(content) {
+			// This is a subquery, don't remove its parentheses
+			break
+		}
+
+		// Check if content starts with a quoted identifier (table name)
+		if !strings.HasPrefix(content, "\"") {
+			break
+		}
+
+		// Find the matching closing parenthesis
+		closeIdx := g.findMatchingParen(result, 0)
+		if closeIdx == -1 {
+			break
+		}
+
+		// Check if there's content after the closing paren
+		afterClose := strings.TrimSpace(result[closeIdx+1:])
+
+		// If there's nothing after or it starts with comma, remove the outer parens
+		if afterClose == "" || strings.HasPrefix(afterClose, ",") {
+			// Remove the outer parentheses
+			innerContent := result[1:closeIdx]
+			result = innerContent + result[closeIdx+1:]
+			continue
+		}
+
+		// If there's something else after (like another expression), stop
+		break
+	}
+
+	return result
+}
+
+// removeTableParentheses removes unnecessary parentheses around simple table names
+// ("table") -> "table"
+// ("table1" AS "alias") -> "table1" AS "alias"
+// But keeps:
+// - (SELECT ...) - subqueries need parentheses
+// - ("table", (SELECT ...)) - complex expressions with nested subqueries
+func (g *PGGenerator) removeTableParentheses(s string) string {
+	result := s
+	i := 0
+
+	for i < len(result) {
+		if result[i] == '(' {
+			// Find matching )
+			closeIdx := g.findMatchingParen(result, i)
+			if closeIdx == -1 {
+				i++
+				continue
+			}
+
+			content := result[i+1 : closeIdx]
+			contentTrimmed := strings.TrimSpace(content)
+
+			// Only remove parentheses if:
+			// 1. Content starts with " (quoted identifier)
+			// 2. Content is NOT a SELECT subquery
+			// 3. Content does NOT contain nested parentheses (to avoid complex cases)
+			if strings.HasPrefix(contentTrimmed, "\"") &&
+				!g.startsWithSelect(contentTrimmed) &&
+				!strings.Contains(content, "(") {
+				// Remove the parentheses - this is a simple table reference
+				result = result[:i] + content + result[closeIdx+1:]
+				// Don't increment i, check again at same position
+				continue
+			}
+		}
+		i++
+	}
+
+	return result
+}
+
+// startsWithSelect checks if content starts with SELECT (ignoring whitespace)
+func (g *PGGenerator) startsWithSelect(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	upper := strings.ToUpper(trimmed)
+	return strings.HasPrefix(upper, "SELECT")
 }
 
 // removeUnsupportedTypeLengths removes length parameters from PostgreSQL integer types

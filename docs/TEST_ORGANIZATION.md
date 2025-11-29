@@ -130,13 +130,13 @@ make test-pg-unsupported
 
 ```bash
 # 运行基础测试
-INTEGRATION_TEST=1 go test -v -run TestBasicQuery ./test/integration/
+go test -v -run TestBasicQuery ./test/integration/
 
 # 运行 MySQL 兼容性测试
-INTEGRATION_TEST=1 go test -v -run TestDataTypes ./test/integration/
+go test -v -run TestDataTypes ./test/integration/
 
 # 运行特定的不支持特性测试
-INTEGRATION_TEST=1 go test -v -run TestMySQLSpecific_ENUM ./test/pg-unsupported/
+go test -v -run TestMySQLSpecific_ENUM ./test/pg-unsupported/
 ```
 
 ## 添加新测试的决策流程

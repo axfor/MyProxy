@@ -1,5 +1,6 @@
 # Binaries
 bin/
+aproxy
 *.exe
 *.dll
 *.so
@@ -36,3 +37,4 @@ dist/
 # Temporary files
 tmp/
 temp/
+info.ini
