@@ -420,6 +420,23 @@ func (se *ShowEmulator) HandleSetCommand(ctx context.Context, sql string, sessio
 	assignment := strings.TrimPrefix(sql, "SET ")
 	assignment = strings.TrimPrefix(assignment, "set ")
 
+	assignment = strings.TrimSpace(assignment)
+
+	fields := strings.Fields(assignment)
+	if len(fields) >= 2 && strings.EqualFold(fields[0], "NAMES") {
+		charset := strings.Trim(fields[1], "'\"")
+		sessionVars["names"] = charset
+		sessionVars["character_set_client"] = charset
+		sessionVars["character_set_connection"] = charset
+		sessionVars["character_set_results"] = charset
+
+		if len(fields) >= 4 && strings.EqualFold(fields[2], "COLLATE") {
+			sessionVars["collation_connection"] = strings.Trim(fields[3], "'\"")
+		}
+
+		return nil
+	}
+
 	parts := strings.SplitN(assignment, "=", 2)
 	if len(parts) != 2 {
 		return fmt.Errorf("invalid SET syntax: %s", sql)
