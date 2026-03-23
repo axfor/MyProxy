@@ -347,15 +347,26 @@ The proxy automatically handles the following MySQL to PostgreSQL conversions:
 | ``` `identifier` ```                 | `"identifier"`                         | String |
 | `?` placeholders                     | `$1, $2, ...`                          | AST    |
 | `AUTO_INCREMENT`                     | `SERIAL` / `BIGSERIAL`                 | AST    |
+| `ENGINE=InnoDB CHARSET=utf8mb4`      | (removed)                              | AST    |
 | `INSERT ... ON DUPLICATE KEY UPDATE` | `INSERT ... ON CONFLICT ... DO UPDATE` | AST    |
 | `REPLACE INTO`                       | `INSERT ... ON CONFLICT ...`           | AST    |
 | `NOW()`                              | `CURRENT_TIMESTAMP`                    | AST    |
 | `IFNULL(a, b)`                       | `COALESCE(a, b)`                       | AST    |
-| `IF(cond, a, b)`                     | `CASE WHEN cond THEN a ELSE b END`     | AST    |
+| `IF(cond, a, b)`                     | `CASE WHEN cond THEN a ELSE b END`     | String |
 | `GROUP_CONCAT()`                     | `STRING_AGG()`                         | AST    |
-| `LAST_INSERT_ID()`                   | `lastval()`                            | String |
-| `LOCK IN SHARE MODE`                 | `FOR SHARE`                            | String |
+| `LAST_INSERT_ID()`                   | `lastval()`                            | AST    |
+| `LOCK IN SHARE MODE`                 | `FOR SHARE`                            | Parser |
 | `LIMIT n, m`                         | `LIMIT m OFFSET n`                     | String |
+| `CREATE DATABASE db`                 | `CREATE SCHEMA db`                     | Handler|
+| `DROP DATABASE db`                   | `DROP SCHEMA db CASCADE`               | Handler|
+| `USE db`                             | `SET search_path TO db`                | Handler|
+| `CREATE USER ... IDENTIFIED BY`      | `CREATE ROLE ... WITH LOGIN PASSWORD`  | AST    |
+| `GRANT ... ON db.*`                  | `GRANT ... ON ALL TABLES IN SCHEMA`    | AST    |
+| `SET GLOBAL read_only = 1`           | `ALTER SYSTEM SET ... + pg_reload`     | AST    |
+| `SELECT @@global.xxx`                | Variable mapping table lookup          | AST    |
+| `KILL [QUERY] id`                    | `pg_terminate/cancel_backend(id)`      | AST    |
+| `START/STOP SLAVE`                   | `pg_wal_replay_resume/pause()`         | Handler|
+| `SHOW SLAVE STATUS`                  | `pg_stat_wal_receiver` query           | Handler|
 
 ## Supported Commands
 
@@ -370,7 +381,7 @@ The proxy automatically handles the following MySQL to PostgreSQL conversions:
 - ✅ COM_INIT_DB (change database)
 
 ### Metadata Commands
-- ✅ SHOW DATABASES (returns logical database names)
+- ✅ SHOW DATABASES (returns PostgreSQL schemas as databases)
 - ✅ SHOW TABLES
 - ✅ SHOW COLUMNS / SHOW FULL COLUMNS
 - ✅ SHOW CREATE TABLE
@@ -379,7 +390,13 @@ The proxy automatically handles the following MySQL to PostgreSQL conversions:
 - ✅ SHOW STATUS / SHOW VARIABLES / SHOW WARNINGS
 - ✅ SHOW GLOBAL VARIABLES / SHOW GLOBAL STATUS
 - ✅ SET variables / SET GLOBAL variables
-- ✅ USE database
+- ✅ SET NAMES charset [COLLATE collation]
+- ✅ USE database → `SET search_path TO schema`
+
+### Database Management (MySQL DB = PostgreSQL Schema)
+- ✅ CREATE DATABASE [IF NOT EXISTS] → `CREATE SCHEMA`
+- ✅ DROP DATABASE [IF EXISTS] → `DROP SCHEMA CASCADE`
+- ✅ USE database → `SET search_path TO schema` (runtime dynamic switching)
 
 ### Replication Management Commands
 - ✅ START SLAVE / STOP SLAVE (incl. SQL_THREAD, IO_THREAD) → `pg_wal_replay_resume/pause()`
@@ -411,8 +428,9 @@ The proxy automatically handles the following MySQL to PostgreSQL conversions:
 
 ### Server Administration
 - ✅ SHOW PROCESSLIST → `pg_stat_activity`
-- ✅ KILL [CONNECTION|QUERY] id → `pg_terminate_backend()` / `pg_cancel_backend()`
+- ✅ KILL [CONNECTION|QUERY] id (AST-based) → `pg_terminate_backend()` / `pg_cancel_backend()`
 - ✅ FLUSH TABLES → Acknowledged (NoOp)
+- ✅ FLUSH PRIVILEGES → NoOp (PG immediate)
 - ✅ ALTER TABLE ... DISCARD/IMPORT TABLESPACE → Error (not supported in PG)
 
 ### Backup & Restore (API)
@@ -423,11 +441,12 @@ The proxy automatically handles the following MySQL to PostgreSQL conversions:
 ### SQL Syntax Support
 
 #### DDL (Data Definition Language)
-- ✅ CREATE TABLE (supports AUTO_INCREMENT, PRIMARY KEY, UNIQUE, INDEX)
-- ✅ DROP TABLE
-- ✅ ALTER TABLE (basic operations)
+- ✅ CREATE TABLE (supports AUTO_INCREMENT, PRIMARY KEY, UNIQUE, INDEX, ENGINE/CHARSET removed at AST level)
+- ✅ DROP TABLE [IF EXISTS]
+- ✅ ALTER TABLE (ADD/DROP COLUMN, ADD/DROP INDEX)
 - ✅ CREATE INDEX
 - ✅ DROP INDEX
+- ✅ TRUNCATE TABLE
 
 #### DML (Data Manipulation Language)
 - ✅ SELECT (supports WHERE, JOIN, GROUP BY, HAVING, ORDER BY, LIMIT)
