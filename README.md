@@ -381,73 +381,126 @@ The proxy automatically handles the following MySQL to PostgreSQL conversions:
 - ✅ COM_INIT_DB (change database)
 
 ### Metadata Commands
-- ✅ SHOW DATABASES (returns PostgreSQL schemas as databases)
-- ✅ SHOW TABLES
-- ✅ SHOW COLUMNS / SHOW FULL COLUMNS
-- ✅ SHOW CREATE TABLE
-- ✅ SHOW INDEX
-- ✅ DESCRIBE/DESC
-- ✅ SHOW STATUS / SHOW VARIABLES / SHOW WARNINGS
-- ✅ SHOW GLOBAL VARIABLES / SHOW GLOBAL STATUS
-- ✅ SET variables / SET GLOBAL variables
-- ✅ SET NAMES charset [COLLATE collation]
-- ✅ USE database → `SET search_path TO schema`
+
+| MySQL | PostgreSQL | Notes |
+|-------|-----------|-------|
+| `SHOW DATABASES` | `SELECT schema_name FROM information_schema.schemata` | Schema = Database |
+| `SHOW TABLES` | `SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()` | |
+| `SHOW COLUMNS FROM t` | `SELECT column_name, data_type, ... FROM information_schema.columns` | Type mapping applied |
+| `SHOW FULL COLUMNS FROM t` | Same + Collation, Privileges, Comment columns | |
+| `SHOW CREATE TABLE t` | Basic structure returned | |
+| `SHOW INDEX FROM t` | `SELECT ... FROM pg_index JOIN pg_class JOIN pg_attribute` | |
+| `DESCRIBE t` / `DESC t` | `SELECT column_name, data_type, is_nullable, ... FROM information_schema.columns` | |
+| `SHOW STATUS` | `SELECT 'Uptime', extract(epoch from (now()-pg_postmaster_start_time()))` | |
+| `SHOW VARIABLES` | Static MySQL-compatible variables (version, charset, autocommit, ...) | |
+| `SHOW VARIABLES LIKE 'xxx'` | Variable mapping table → fallback `pg_settings` | |
+| `SHOW GLOBAL VARIABLES` | Static binlog/replication variables (binlog_format, server_id, ...) | |
+| `SHOW GLOBAL VARIABLES LIKE 'xxx'` | Variable mapping table → fallback hardcoded | |
+| `SHOW GLOBAL STATUS` | `SELECT 'Uptime', ... UNION SELECT 'rpl_semi_sync_master_status', ...` | |
+| `SHOW GLOBAL STATUS WHERE Variable_name='xxx'` | Per-variable PG query via status mapping | |
+| `SHOW WARNINGS` | Empty result set | |
+| `SET @@var = value` | Store in session variables | |
+| `SET GLOBAL var = value` | `ALTER SYSTEM SET pg_var = 'value'; SELECT pg_reload_conf()` | |
+| `SET NAMES utf8mb4 COLLATE xxx` | Store charset/collation in session | |
+| `USE mydb` | `SET search_path TO mydb` | Runtime dynamic |
 
 ### Database Management (MySQL DB = PostgreSQL Schema)
-- ✅ CREATE DATABASE [IF NOT EXISTS] → `CREATE SCHEMA`
-- ✅ DROP DATABASE [IF EXISTS] → `DROP SCHEMA CASCADE`
-- ✅ USE database → `SET search_path TO schema` (runtime dynamic switching)
+
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `CREATE DATABASE mydb` | `CREATE SCHEMA mydb` |
+| `CREATE DATABASE IF NOT EXISTS mydb` | `CREATE SCHEMA IF NOT EXISTS mydb` |
+| `DROP DATABASE mydb` | `DROP SCHEMA mydb CASCADE` |
+| `DROP DATABASE IF EXISTS mydb` | `DROP SCHEMA IF EXISTS mydb CASCADE` |
+| `USE mydb` | `SET search_path TO mydb` |
 
 ### Replication Management Commands
-- ✅ START SLAVE / STOP SLAVE (incl. SQL_THREAD, IO_THREAD) → `pg_wal_replay_resume/pause()`
-- ✅ CHANGE MASTER TO (MASTER_HOST, MASTER_PORT, MASTER_USER, MASTER_PASSWORD, MASTER_AUTO_POSITION) → `ALTER SYSTEM SET primary_conninfo`
-- ✅ RESET SLAVE → `ALTER SYSTEM RESET primary_conninfo`
-- ✅ RESET MASTER → `pg_switch_wal()`
-- ✅ SHOW SLAVE STATUS (incl. FOR CHANNEL filtering) → `pg_stat_wal_receiver`
-- ✅ SHOW SLAVE HOSTS → `pg_stat_replication`
-- ✅ SHOW MASTER STATUS → `pg_current_wal_lsn()` + `pg_walfile_name()`
-- ✅ SHOW BINARY LOGS → `pg_ls_waldir()`
-- ✅ SHOW GLOBAL STATUS WHERE Variable_name='xxx' → status variable mapping
-- ✅ SHOW GLOBAL VARIABLES WHERE/LIKE 'xxx' → variable mapping table lookup
-- ✅ SHOW VARIABLES LIKE 'xxx' → variable mapping table first, then `pg_settings` fallback
+
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `START SLAVE` | `SELECT pg_wal_replay_resume()` |
+| `START SLAVE SQL_THREAD` | `SELECT pg_wal_replay_resume()` |
+| `STOP SLAVE` | `SELECT pg_wal_replay_pause()` |
+| `STOP SLAVE SQL_THREAD` | `SELECT pg_wal_replay_pause()` |
+| `STOP SLAVE IO_THREAD` | `SELECT pg_wal_replay_pause()` |
+| `CHANGE MASTER TO MASTER_HOST='h', MASTER_PORT=p, MASTER_USER='u', MASTER_PASSWORD='pw'` | `ALTER SYSTEM SET primary_conninfo = 'host=h port=p user=u password=pw'; SELECT pg_reload_conf()` |
+| `CHANGE MASTER TO ... MASTER_AUTO_POSITION=1` | Acknowledged (PG uses LSN auto-positioning) |
+| `RESET SLAVE` | `ALTER SYSTEM RESET primary_conninfo; SELECT pg_reload_conf()` |
+| `RESET MASTER` | `SELECT pg_switch_wal()` |
+| `SHOW SLAVE STATUS` | Query `pg_stat_wal_receiver` + `pg_is_wal_replay_paused()` + `pg_last_xact_replay_timestamp()` |
+| `SHOW SLAVE STATUS FOR CHANNEL 'ch'` | Same + filter by `slot_name = 'ch'` |
+| `SHOW SLAVE HOSTS` | `SELECT pid, client_addr, application_name FROM pg_stat_replication` |
+| `SHOW MASTER STATUS` | `SELECT pg_walfile_name(pg_current_wal_lsn()), pg_current_wal_lsn()` |
+| `SHOW BINARY LOGS` | `SELECT name, size FROM pg_ls_waldir() ORDER BY name DESC LIMIT 20` |
 
 ### Variable Mapping (SET GLOBAL / SELECT @@)
-- ✅ `read_only` / `super_read_only` → `default_transaction_read_only`
-- ✅ `rpl_semi_sync_master_enabled` → `synchronous_commit`
-- ✅ `rpl_semi_sync_slave_enabled` → NoOp (PG automatic)
-- ✅ `rpl_semi_sync_master_status` → query `synchronous_commit` setting
-- ✅ `rpl_semi_sync_master_clients` → `count(*) FROM pg_stat_replication WHERE sync_state='sync'`
-- ✅ `max_connections` → `max_connections` (ALTER SYSTEM, requires restart)
-- ✅ `wait_timeout` → `idle_in_transaction_session_timeout` (seconds→ms conversion)
-- ✅ `foreign_key_checks` → `session_replication_role` (0→replica, 1→origin)
-- ✅ `sql_log_bin` → `log_statement` (0→none, 1→all)
-- ✅ `server_id` / `server_uuid` / `report_host` → internal storage (runtime writable)
-- ✅ `gtid_purged` / `gtid_mode` / `gtid_executed` → compatibility stubs
-- ✅ `master_auto_position` → acknowledged (PG uses LSN auto-positioning by default)
-- ✅ `binlog_format` → static `ROW` / `log_bin` → static `ON`
-- ✅ `@@version` → PostgreSQL `server_version` + `-MyProxy` suffix
-- ✅ `@@version_comment` → `MyProxy (MySQL to PostgreSQL Proxy)`
-- ✅ Character sets (`character_set_*`, `collation_*`) → static `utf8mb4`/`utf8mb4_general_ci`
-- ✅ `sql_mode` / `max_allowed_packet` / `net_*_timeout` → static compatibility values
 
-### ACL Management (AST-based)
-- ✅ CREATE USER → `CREATE ROLE ... WITH LOGIN PASSWORD`
-- ✅ DROP USER → `DROP ROLE`
-- ✅ GRANT (SELECT, INSERT, REPLICATION SLAVE, ALL, ...) → PostgreSQL GRANT / ALTER ROLE
-- ✅ REVOKE → PostgreSQL REVOKE / ALTER ROLE
-- ✅ FLUSH PRIVILEGES → NoOp (PG immediate)
+| MySQL Variable | PostgreSQL Equivalent | SET GLOBAL Example |
+|---------------|----------------------|-------------------|
+| `read_only` | `default_transaction_read_only` | `ALTER SYSTEM SET default_transaction_read_only = 'on'; SELECT pg_reload_conf()` |
+| `super_read_only` | `default_transaction_read_only` | Same as read_only |
+| `rpl_semi_sync_master_enabled` | `synchronous_commit` | `ALTER SYSTEM SET synchronous_commit = 'on'; SELECT pg_reload_conf()` |
+| `rpl_semi_sync_slave_enabled` | NoOp | Returns OK (PG automatic) |
+| `rpl_semi_sync_master_status` | `SHOW synchronous_commit` | ON if sync/remote_write/remote_apply |
+| `rpl_semi_sync_master_clients` | `SELECT count(*) FROM pg_stat_replication WHERE sync_state = 'sync'` | |
+| `max_connections` | `max_connections` | `ALTER SYSTEM SET max_connections = N; SELECT pg_reload_conf()` (needs restart) |
+| `wait_timeout = 600` | `idle_in_transaction_session_timeout` | `ALTER SYSTEM SET idle_in_transaction_session_timeout = '600000'` (s→ms) |
+| `foreign_key_checks = 0` | `session_replication_role` | `SET session_replication_role = 'replica'` (disables FK) |
+| `foreign_key_checks = 1` | `session_replication_role` | `SET session_replication_role = 'origin'` (enables FK) |
+| `sql_log_bin = 0` | `log_statement` | `SET log_statement = 'none'` |
+| `sql_log_bin = 1` | `log_statement` | `SET log_statement = 'all'` |
+| `server_id` / `server_uuid` | Internal storage | Runtime writable, returns stored value |
+| `report_host` | Internal storage | Runtime writable |
+| `gtid_purged` | NoOp | `SET GLOBAL gtid_purged = ''` returns OK |
+| `gtid_mode` | Static `OFF` | PG uses LSN, not GTID |
+| `gtid_executed` | Static `''` | |
+| `master_auto_position` | Acknowledged | PG always uses LSN auto-positioning |
+| `binlog_format` | Static `ROW` | |
+| `log_bin` | Static `ON` | |
+| `binlog_checksum` | Static `CRC32` | |
+| `@@version` | `SHOW server_version` | Returns `16.13-MyProxy` |
+| `@@version_comment` | Static | `MyProxy (MySQL to PostgreSQL Proxy)` |
+| `character_set_*` | Static `utf8mb4` | PG always uses UTF-8 |
+| `collation_*` | Static `utf8mb4_general_ci` | |
+| `sql_mode` | Static `TRADITIONAL` | |
+| `max_allowed_packet` | Static `67108864` | |
+
+### ACL Management (AST-based via TiDB Parser)
+
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `CREATE USER 'user'@'host' IDENTIFIED BY 'pass'` | `CREATE ROLE user WITH LOGIN PASSWORD 'pass'` |
+| `DROP USER 'user'@'host'` | `DROP ROLE user` |
+| `DROP USER IF EXISTS 'user'@'host'` | `DROP ROLE IF EXISTS user` |
+| `GRANT SELECT, INSERT ON db.* TO 'user'@'%'` | `GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA db TO user` |
+| `GRANT ALL PRIVILEGES ON *.* TO 'user'@'%'` | `GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO user` |
+| `GRANT REPLICATION SLAVE ON *.* TO 'user'@'%'` | `ALTER ROLE user REPLICATION` |
+| `REVOKE SELECT ON db.* FROM 'user'@'%'` | `REVOKE SELECT ON ALL TABLES IN SCHEMA db FROM user` |
+| `REVOKE REPLICATION SLAVE ON *.* FROM 'user'@'%'` | `ALTER ROLE user NOREPLICATION` |
+| `FLUSH PRIVILEGES` | NoOp (PG privileges take effect immediately) |
 
 ### Server Administration
-- ✅ SHOW PROCESSLIST → `pg_stat_activity`
-- ✅ KILL [CONNECTION|QUERY] id (AST-based) → `pg_terminate_backend()` / `pg_cancel_backend()`
-- ✅ FLUSH TABLES → Acknowledged (NoOp)
-- ✅ FLUSH PRIVILEGES → NoOp (PG immediate)
-- ✅ ALTER TABLE ... DISCARD/IMPORT TABLESPACE → Error (not supported in PG)
+
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `SHOW PROCESSLIST` | `SELECT pid, usename, client_addr, datname, state, query FROM pg_stat_activity` |
+| `SHOW FULL PROCESSLIST` | Same as above |
+| `KILL 123` | `SELECT pg_terminate_backend(123)` |
+| `KILL CONNECTION 123` | `SELECT pg_terminate_backend(123)` |
+| `KILL QUERY 123` | `SELECT pg_cancel_backend(123)` |
+| `FLUSH TABLES` | Returns OK (PG manages cache automatically) |
+| `ALTER TABLE t DISCARD TABLESPACE` | Returns error (not supported in PG) |
+| `ALTER TABLE t IMPORT TABLESPACE` | Returns error (not supported in PG) |
 
 ### Backup & Restore (API)
-- ✅ Physical backup (xtrabackup equivalent) → `pg_basebackup`
-- ✅ Logical backup (mysqldump equivalent) → `pg_dump`
-- ✅ Restore → `rsync` / `pg_restore`
+
+| MySQL Tool | PostgreSQL Equivalent | MyProxy API |
+|-----------|----------------------|-------------|
+| `xtrabackup --backup` | `pg_basebackup -D dir -Fp -Xs` | `BackupManager.PhysicalBackup()` |
+| `xtrabackup --prepare` | Not needed (PG backups are immediately usable) | Skipped |
+| `xtrabackup --copy-back` | `rsync -a backup/ pgdata/` | `BackupManager.Restore()` |
+| `mysqldump` | `pg_dump -f dump.sql` | `BackupManager.LogicalBackup()` |
+| `mysql < dump.sql` | `psql -f dump.sql` / `pg_restore` | `BackupManager.LogicalRestore()` |
 
 ### SQL Syntax Support
 
