@@ -12,20 +12,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// getE2EDSN returns the DSN for e2e tests.
-// Uses MYPROXY_DSN env var, or defaults to config-e2e.yaml credentials.
+const e2eSchemaName = "e2e_testdb"
+
+// getE2EDSN returns the base DSN (no database specified).
 func getE2EDSN() string {
 	if dsn := os.Getenv("MYPROXY_DSN"); dsn != "" {
 		return dsn
 	}
-	return "myproxy:myproxy@tcp(localhost:13306)/test?parseTime=true"
+	return "myproxy:myproxy@tcp(localhost:13306)/?parseTime=true"
 }
 
+// setupAdminDB connects, creates a dedicated schema, and switches to it.
+// No operations use the public schema.
 func setupAdminDB(tb testing.TB) (*sql.DB, func()) {
 	db, err := sql.Open("mysql", getE2EDSN())
 	require.NoError(tb, err)
 	require.NoError(tb, db.Ping())
-	return db, func() { db.Close() }
+
+	// Create dedicated test schema (MySQL: CREATE DATABASE → PG: CREATE SCHEMA)
+	_, _ = db.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", e2eSchemaName))
+	_, err = db.Exec(fmt.Sprintf("USE %s", e2eSchemaName))
+	require.NoError(tb, err)
+
+	cleanup := func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s", e2eSchemaName))
+		db.Close()
+	}
+
+	return db, cleanup
 }
 
 // ================================================================

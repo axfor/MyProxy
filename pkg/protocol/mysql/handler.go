@@ -170,6 +170,11 @@ func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
 		return ch.handleUseCommand(ctx, query)
 	}
 
+	// Handle CREATE DATABASE / DROP DATABASE → CREATE SCHEMA / DROP SCHEMA
+	if isDatabaseStatement(query) {
+		return ch.handleDatabaseCommand(ctx, query, startTime)
+	}
+
 	// Handle SELECT @@global.xxx / SELECT @@xxx variable queries
 	if result, handled := ch.handleSelectVariable(ctx, query); handled {
 		return result, nil
@@ -1167,6 +1172,63 @@ func isFlushStatement(query string) bool {
 func isTablespaceStatement(query string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(query))
 	return strings.Contains(upper, "DISCARD TABLESPACE") || strings.Contains(upper, "IMPORT TABLESPACE")
+}
+
+// isDatabaseStatement checks if the query is CREATE DATABASE or DROP DATABASE
+func isDatabaseStatement(query string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	return strings.HasPrefix(upper, "CREATE DATABASE") || strings.HasPrefix(upper, "DROP DATABASE")
+}
+
+// handleDatabaseCommand converts MySQL CREATE/DROP DATABASE to PostgreSQL CREATE/DROP SCHEMA
+// MySQL database = PostgreSQL schema (within the same PG database)
+func (ch *ConnectionHandler) handleDatabaseCommand(ctx context.Context, query string, startTime time.Time) (*mysql.Result, error) {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	fields := strings.Fields(query)
+
+	if strings.HasPrefix(upper, "CREATE DATABASE") {
+		// CREATE DATABASE [IF NOT EXISTS] dbname
+		idx := 2 // skip "CREATE DATABASE"
+		ifNotExists := ""
+		if idx+2 < len(fields) && strings.ToUpper(fields[idx]) == "IF" && strings.ToUpper(fields[idx+1]) == "NOT" && strings.ToUpper(fields[idx+2]) == "EXISTS" {
+			ifNotExists = "IF NOT EXISTS "
+			idx += 3
+		}
+		if idx >= len(fields) {
+			return nil, mysql.NewError(mysql.ER_SYNTAX_ERROR, "missing database name in CREATE DATABASE")
+		}
+		dbName := strings.Trim(fields[idx], "`\"';")
+		pgSQL := fmt.Sprintf("CREATE SCHEMA %s%s", ifNotExists, dbName)
+		if _, err := ch.pgConn.Exec(ctx, pgSQL); err != nil {
+			errorCode, errorMsg := ch.handler.errorMapper.MapError(err)
+			return nil, mysql.NewError(errorCode, errorMsg)
+		}
+		ch.handler.logger.LogQuery(ch.session.ID, ch.session.User, ch.session.ClientAddr, query, time.Since(startTime).Seconds(), 0, nil)
+		return &mysql.Result{Status: 0}, nil
+	}
+
+	if strings.HasPrefix(upper, "DROP DATABASE") {
+		// DROP DATABASE [IF EXISTS] dbname
+		idx := 2 // skip "DROP DATABASE"
+		ifExists := ""
+		if idx+1 < len(fields) && strings.ToUpper(fields[idx]) == "IF" && strings.ToUpper(fields[idx+1]) == "EXISTS" {
+			ifExists = "IF EXISTS "
+			idx += 2
+		}
+		if idx >= len(fields) {
+			return nil, mysql.NewError(mysql.ER_SYNTAX_ERROR, "missing database name in DROP DATABASE")
+		}
+		dbName := strings.Trim(fields[idx], "`\"';")
+		pgSQL := fmt.Sprintf("DROP SCHEMA %s%s CASCADE", ifExists, dbName)
+		if _, err := ch.pgConn.Exec(ctx, pgSQL); err != nil {
+			errorCode, errorMsg := ch.handler.errorMapper.MapError(err)
+			return nil, mysql.NewError(errorCode, errorMsg)
+		}
+		ch.handler.logger.LogQuery(ch.session.ID, ch.session.User, ch.session.ClientAddr, query, time.Since(startTime).Seconds(), 0, nil)
+		return &mysql.Result{Status: 0}, nil
+	}
+
+	return nil, mysql.NewError(mysql.ER_SYNTAX_ERROR, "unsupported DATABASE command")
 }
 
 // handleKillCommand maps MySQL KILL to pg_terminate_backend / pg_cancel_backend
