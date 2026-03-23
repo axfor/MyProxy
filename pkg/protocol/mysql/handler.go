@@ -8,14 +8,15 @@ import (
 	"strings"
 	"time"
 
-	"aproxy/internal/pool"
-	"aproxy/pkg/mapper"
-	"aproxy/pkg/observability"
-	"aproxy/pkg/replication"
-	"aproxy/pkg/reqtrack"
-	"aproxy/pkg/schema"
-	"aproxy/pkg/session"
-	"aproxy/pkg/sqlrewrite"
+	"MyProxy/internal/pool"
+	"MyProxy/pkg/admin"
+	"MyProxy/pkg/mapper"
+	"MyProxy/pkg/observability"
+	"MyProxy/pkg/replication"
+	"MyProxy/pkg/reqtrack"
+	"MyProxy/pkg/schema"
+	"MyProxy/pkg/session"
+	"MyProxy/pkg/sqlrewrite"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 	"github.com/jackc/pgx/v5"
@@ -27,9 +28,11 @@ type Handler struct {
 	pgPool       *pool.Pool
 	sessionMgr   *session.Manager
 	rewriter     *sqlrewrite.Rewriter
+	stmtParser   *sqlrewrite.StmtParser
 	typeMapper   *mapper.TypeMapper
 	errorMapper  *mapper.ErrorMapper
 	showEmulator *mapper.ShowEmulator
+	replAdmin    *admin.ReplicationAdmin
 	metrics      *observability.Metrics
 	logger       *observability.Logger
 	debugSQL     bool
@@ -49,9 +52,11 @@ func NewHandler(
 		pgPool:       pgPool,
 		sessionMgr:   sessionMgr,
 		rewriter:     rewriter,
+		stmtParser:   sqlrewrite.NewStmtParser(),
 		typeMapper:   mapper.NewTypeMapper(),
 		errorMapper:  mapper.NewErrorMapper(),
 		showEmulator: mapper.NewShowEmulator(),
+		replAdmin:    admin.NewReplicationAdmin(),
 		metrics:      metrics,
 		logger:       logger,
 		debugSQL:     debugSQL,
@@ -131,6 +136,11 @@ func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
 		return ch.handleUseCommand(ctx, query)
 	}
 
+	// Handle SELECT @@global.xxx / SELECT @@xxx variable queries
+	if result, handled := ch.handleSelectVariable(ctx, query); handled {
+		return result, nil
+	}
+
 	// Handle transaction control statements
 	if ch.handler.rewriter.IsBeginStatement(query) {
 		if err := ch.session.BeginTransaction(); err != nil {
@@ -162,14 +172,71 @@ func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
 		return &mysql.Result{Status: 0}, nil
 	}
 
-	// Handle KILL command - MySQL clients send this to terminate connections
-	// PostgreSQL doesn't support KILL, so we just return OK
+	// Handle KILL command - map to pg_terminate_backend / pg_cancel_backend
 	if isKillStatement(query) {
-		ch.handler.logger.Info("KILL command received (ignored)",
+		return ch.handleKillCommand(ctx, query, startTime)
+	}
+
+	// Handle replication control commands (START/STOP SLAVE, CHANGE MASTER TO, etc.)
+	if admin.IsReplicationCommand(query) {
+		handled, err := ch.handler.replAdmin.HandleReplicationCommand(ctx, ch.pgConn, query)
+		if handled {
+			if err != nil {
+				ch.handler.logger.Error("Replication command failed",
+					zap.String("query", query), zap.Error(err))
+				return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, err.Error())
+			}
+			ch.handler.logger.Info("Replication command handled",
+				zap.String("session_id", ch.session.ID),
+				zap.String("query", query))
+			ch.handler.logger.LogQuery(ch.session.ID, ch.session.User, ch.session.ClientAddr, query, time.Since(startTime).Seconds(), 0, nil)
+			return &mysql.Result{Status: 0}, nil
+		}
+	}
+
+	// Handle ACL commands (CREATE USER, GRANT, REVOKE, DROP USER, FLUSH PRIVILEGES)
+	if sqlrewrite.IsACLCommand(query) {
+		rewritten, handled := sqlrewrite.RewriteACL(query)
+		if handled {
+			if rewritten == "" {
+				// FLUSH PRIVILEGES - no-op in PostgreSQL
+				ch.handler.logger.LogQuery(ch.session.ID, ch.session.User, ch.session.ClientAddr, query, time.Since(startTime).Seconds(), 0, nil)
+				return &mysql.Result{Status: 0}, nil
+			}
+			_, err := ch.pgConn.Exec(ctx, rewritten)
+			if err != nil {
+				ch.handler.logger.Error("ACL command failed",
+					zap.String("mysql", query),
+					zap.String("pg", rewritten),
+					zap.Error(err))
+				errorCode, errorMsg := ch.handler.errorMapper.MapError(err)
+				return nil, mysql.NewError(errorCode, errorMsg)
+			}
+			ch.handler.logger.Info("ACL command handled",
+				zap.String("mysql", query),
+				zap.String("pg", rewritten))
+			ch.handler.logger.LogQuery(ch.session.ID, ch.session.User, ch.session.ClientAddr, query, time.Since(startTime).Seconds(), 0, nil)
+			return &mysql.Result{Status: 0}, nil
+		}
+	}
+
+	// Handle FLUSH commands
+	if isFlushStatement(query) {
+		ch.handler.logger.Info("FLUSH command received (acknowledged)",
 			zap.String("session_id", ch.session.ID),
 			zap.String("query", query))
 		ch.handler.logger.LogQuery(ch.session.ID, ch.session.User, ch.session.ClientAddr, query, time.Since(startTime).Seconds(), 0, nil)
 		return &mysql.Result{Status: 0}, nil
+	}
+
+	// Handle ALTER TABLE ... DISCARD/IMPORT TABLESPACE
+	// PostgreSQL doesn't support tablespace import/discard per table
+	if isTablespaceStatement(query) {
+		ch.handler.logger.Warn("TABLESPACE operation not supported in PostgreSQL",
+			zap.String("session_id", ch.session.ID),
+			zap.String("query", query))
+		return nil, mysql.NewError(mysql.ER_NOT_SUPPORTED_YET,
+			"ALTER TABLE ... DISCARD/IMPORT TABLESPACE is not supported (PostgreSQL does not have per-table tablespace import/export)")
 	}
 
 	// Detect unsupported MySQL features before rewriting
@@ -934,14 +1001,71 @@ func (ch *ConnectionHandler) handleShowCommand(ctx context.Context, query string
 }
 
 func (ch *ConnectionHandler) handleSetCommand(ctx context.Context, query string) (*mysql.Result, error) {
-	sessionVars := make(map[string]interface{})
+	// Use AST parser to extract variable assignments
+	vars := ch.handler.stmtParser.ParseSet(query)
+	if vars != nil {
+		for _, v := range vars {
+			// Handle SET GLOBAL: map to PostgreSQL ALTER SYSTEM SET + reload
+			if v.IsGlobal {
+				handled, err := mapper.HandleSetGlobal(ctx, ch.pgConn, v.Name, v.Value)
+				if err != nil {
+					ch.handler.logger.Error("SET GLOBAL failed",
+						zap.String("var", v.Name),
+						zap.String("value", v.Value),
+						zap.Error(err))
+					return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, err.Error())
+				}
+				if handled {
+					ch.handler.logger.Info("SET GLOBAL handled",
+						zap.String("var", v.Name),
+						zap.String("value", v.Value))
+					continue
+				}
+				ch.handler.logger.Warn("SET GLOBAL unknown variable, ignored",
+					zap.String("var", v.Name))
+				continue
+			}
 
-	err := ch.handler.showEmulator.HandleSetCommand(ctx, query, sessionVars)
-	if err != nil {
+			// Handle AUTOCOMMIT specially
+			if strings.ToLower(v.Name) == "autocommit" {
+				val := strings.ToUpper(v.Value)
+				autocommit := val == "ON" || val == "1" || val == "TRUE"
+				if err := ch.session.SetAutocommit(autocommit); err != nil {
+					ch.handler.metrics.IncErrors("transaction")
+					ch.handler.logger.LogError(ch.session.ID, ch.session.User, ch.session.ClientAddr, "set_autocommit", err)
+					return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR, err.Error())
+				}
+				ch.session.SetSessionVar(v.Name, v.Value)
+				continue
+			}
+
+			// Handle SET SESSION: try variable mapping first
+			if v.IsSystem {
+				handled, err := mapper.HandleSetSession(ctx, ch.pgConn, v.Name, v.Value)
+				if err != nil {
+					ch.handler.logger.Warn("SET SESSION mapped variable failed, storing locally",
+						zap.String("var", v.Name),
+						zap.Error(err))
+				}
+				if handled {
+					ch.session.SetSessionVar(v.Name, v.Value)
+					continue
+				}
+			}
+
+			// Store as session/user variable
+			ch.session.SetSessionVar(v.Name, v.Value)
+		}
+
+		return &mysql.Result{Status: 0}, nil
+	}
+
+	// AST parse failed, fall back to string-based handling
+	sessionVars := make(map[string]interface{})
+	if err := ch.handler.showEmulator.HandleSetCommand(ctx, query, sessionVars); err != nil {
 		return nil, err
 	}
 
-	// Handle AUTOCOMMIT specially to manage transaction state
 	for k, v := range sessionVars {
 		if strings.ToLower(k) == "autocommit" {
 			autocommit := false
@@ -953,7 +1077,6 @@ func (ch *ConnectionHandler) handleSetCommand(ctx context.Context, query string)
 			case bool:
 				autocommit = val
 			}
-
 			if err := ch.session.SetAutocommit(autocommit); err != nil {
 				ch.handler.metrics.IncErrors("transaction")
 				ch.handler.logger.LogError(ch.session.ID, ch.session.User, ch.session.ClientAddr, "set_autocommit", err)
@@ -963,12 +1086,7 @@ func (ch *ConnectionHandler) handleSetCommand(ctx context.Context, query string)
 		ch.session.SetSessionVar(k, v)
 	}
 
-	result := &mysql.Result{
-		Status:       0,
-		AffectedRows: 0,
-	}
-
-	return result, nil
+	return &mysql.Result{Status: 0}, nil
 }
 
 func (ch *ConnectionHandler) handleUseCommand(ctx context.Context, query string) (*mysql.Result, error) {
@@ -985,13 +1103,85 @@ func (ch *ConnectionHandler) handleUseCommand(ctx context.Context, query string)
 	return result, nil
 }
 
+// handleSelectVariable intercepts SELECT @@global.xxx / SELECT @@xxx queries
+// and returns the mapped PostgreSQL value via the variable mapping table.
+// Uses AST parsing to accurately extract variable name and scope.
+// Returns (result, true) if handled, (nil, false) if not a variable query.
+func (ch *ConnectionHandler) handleSelectVariable(ctx context.Context, query string) (*mysql.Result, bool) {
+	varInfo := ch.handler.stmtParser.ParseSelectVariable(query)
+	if varInfo == nil {
+		return nil, false
+	}
+
+	value, found, err := mapper.GetMySQLVarValue(ctx, ch.pgConn, varInfo.VarName)
+	if !found {
+		return nil, false // not a mapped variable, let normal SQL path handle it
+	}
+	if err != nil {
+		ch.handler.logger.Warn("SELECT @@variable failed",
+			zap.String("var", varInfo.VarName), zap.Error(err))
+		return nil, false
+	}
+
+	// Build column name to match MySQL format
+	columnName := "@@" + varInfo.VarName
+	if varInfo.IsGlobal {
+		columnName = "@@global." + varInfo.VarName
+	}
+
+	rs, err := mysql.BuildSimpleResultset(
+		[]string{columnName},
+		[][]interface{}{{value}},
+		false,
+	)
+	if err != nil {
+		return nil, false
+	}
+
+	return &mysql.Result{Status: 0, Resultset: rs}, true
+}
+
 // isKillStatement checks if the query is a MySQL KILL command
-// MySQL clients send KILL <id> to terminate connections, but PostgreSQL doesn't support this.
-// We intercept and return OK to avoid errors on graceful client disconnect.
 func isKillStatement(query string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(query))
-	// Match KILL <id>, KILL CONNECTION <id>, KILL QUERY <id>
 	return strings.HasPrefix(upper, "KILL ")
+}
+
+// isFlushStatement checks if the query is a MySQL FLUSH command
+func isFlushStatement(query string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	return strings.HasPrefix(upper, "FLUSH ")
+}
+
+// isTablespaceStatement checks if the query is an ALTER TABLE ... DISCARD/IMPORT TABLESPACE
+func isTablespaceStatement(query string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	return strings.Contains(upper, "DISCARD TABLESPACE") || strings.Contains(upper, "IMPORT TABLESPACE")
+}
+
+// handleKillCommand maps MySQL KILL to pg_terminate_backend / pg_cancel_backend
+// Uses AST parsing to extract connection ID and query-only flag.
+func (ch *ConnectionHandler) handleKillCommand(ctx context.Context, query string, startTime time.Time) (*mysql.Result, error) {
+	killInfo := ch.handler.stmtParser.ParseKill(query)
+	if killInfo == nil {
+		// AST parse failed, just return OK
+		ch.handler.logger.LogQuery(ch.session.ID, ch.session.User, ch.session.ClientAddr, query, time.Since(startTime).Seconds(), 0, nil)
+		return &mysql.Result{Status: 0}, nil
+	}
+
+	pgFunc := "pg_terminate_backend"
+	if killInfo.QueryOnly {
+		pgFunc = "pg_cancel_backend"
+	}
+
+	_, err := ch.pgConn.Exec(ctx, fmt.Sprintf("SELECT %s(%d)", pgFunc, killInfo.ConnectionID))
+	if err != nil {
+		ch.handler.logger.Warn("KILL command failed",
+			zap.String("query", query), zap.Error(err))
+	}
+
+	ch.handler.logger.LogQuery(ch.session.ID, ch.session.User, ch.session.ClientAddr, query, time.Since(startTime).Seconds(), 0, nil)
+	return &mysql.Result{Status: 0}, nil
 }
 
 // extractInsertTableName extracts the table name from an INSERT statement

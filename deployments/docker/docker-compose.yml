@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: myproxy-pg
+    environment:
+      POSTGRES_USER: myproxy
+      POSTGRES_PASSWORD: myproxy
+      POSTGRES_DB: test
+    ports:
+      - "15432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myproxy -d test"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  myproxy:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    container_name: myproxy
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "13306:3306"
+      - "19091:9091"
+    volumes:
+      - ./config-e2e.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 3306 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

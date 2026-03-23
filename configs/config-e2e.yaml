@@ -1,0 +1,45 @@
+server:
+  host: "0.0.0.0"
+  port: 13306
+  max_connections: 100
+  read_timeout: 30s
+  write_timeout: 30s
+
+postgres:
+  host: "localhost"
+  port: 15432
+  database: "test"
+  user: "myproxy"
+  password: "myproxy"
+  max_pool_size: 20
+  connection_mode: "session_affinity"
+  ssl_mode: "disable"
+
+auth:
+  mode: "pass_through"
+  allowed_users: []
+
+security:
+  rate_limit_per_second: 0
+  max_connections_per_ip: 0
+
+sql_rewrite:
+  enabled: true
+  debug_sql: true
+
+observability:
+  metrics_port: 19091
+  log_level: "debug"
+  log_format: "console"
+  enable_query_log: true
+
+schema_cache:
+  enabled: true
+  ttl: 5m
+  invalidate_on_ddl: true
+
+binlog:
+  enabled: false
+
+cdc:
+  enabled: false

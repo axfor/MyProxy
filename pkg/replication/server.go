@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"aproxy/pkg/observability"
+	"MyProxy/pkg/observability"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"go.uber.org/zap"

@@ -1,4 +1,4 @@
-module aproxy
+module MyProxy
 
 go 1.25.3
 

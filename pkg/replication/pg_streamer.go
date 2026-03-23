@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"aproxy/pkg/observability"
+	"MyProxy/pkg/observability"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"

@@ -54,8 +54,32 @@ func (se *ShowEmulator) HandleShowCommand(ctx context.Context, conn *pgx.Conn, s
 		return se.showGlobalVariables(ctx, conn, sql)
 	}
 
+	if strings.HasPrefix(upperSQL, "SHOW GLOBAL STATUS") {
+		return se.showGlobalStatus(ctx, conn, sql)
+	}
+
 	if strings.HasPrefix(upperSQL, "SHOW WARNINGS") {
 		return se.showWarnings(ctx, conn)
+	}
+
+	if strings.HasPrefix(upperSQL, "SHOW SLAVE STATUS") {
+		return se.showSlaveStatus(ctx, conn, sql)
+	}
+
+	if strings.HasPrefix(upperSQL, "SHOW SLAVE HOSTS") || strings.HasPrefix(upperSQL, "SHOW REPLICAS") {
+		return se.showSlaveHosts(ctx, conn)
+	}
+
+	if strings.HasPrefix(upperSQL, "SHOW MASTER STATUS") {
+		return se.showMasterStatus(ctx, conn)
+	}
+
+	if strings.HasPrefix(upperSQL, "SHOW BINARY LOGS") || strings.HasPrefix(upperSQL, "SHOW MASTER LOGS") {
+		return se.showBinaryLogs(ctx, conn)
+	}
+
+	if strings.HasPrefix(upperSQL, "SHOW PROCESSLIST") || strings.HasPrefix(upperSQL, "SHOW FULL PROCESSLIST") {
+		return se.showProcessList(ctx, conn)
 	}
 
 	return nil, fmt.Errorf("unsupported SHOW command: %s", sql)
@@ -410,15 +434,24 @@ func (se *ShowEmulator) extractTableName(sql string) string {
 	return ""
 }
 
+// HandleSetCommand is a simple string-based fallback for SET commands
+// when AST parsing fails. The primary SET handling is done via AST in the handler.
 func (se *ShowEmulator) HandleSetCommand(ctx context.Context, sql string, sessionVars map[string]interface{}) error {
 	upperSQL := strings.ToUpper(strings.TrimSpace(sql))
-
 	if !strings.HasPrefix(upperSQL, "SET ") {
 		return fmt.Errorf("not a SET command: %s", sql)
 	}
 
-	assignment := strings.TrimPrefix(sql, "SET ")
-	assignment = strings.TrimPrefix(assignment, "set ")
+	assignment := sql[4:] // skip "SET "
+
+	// Strip scope prefixes
+	upperAssign := strings.ToUpper(assignment)
+	for _, prefix := range []string{"GLOBAL ", "SESSION ", "@@GLOBAL.", "@@SESSION.", "@@"} {
+		if strings.HasPrefix(upperAssign, prefix) {
+			assignment = assignment[len(prefix):]
+			break
+		}
+	}
 
 	parts := strings.SplitN(assignment, "=", 2)
 	if len(parts) != 2 {
@@ -428,15 +461,6 @@ func (se *ShowEmulator) HandleSetCommand(ctx context.Context, sql string, sessio
 	varName := strings.TrimSpace(parts[0])
 	varValue := strings.TrimSpace(parts[1])
 	varValue = strings.Trim(varValue, "'\"")
-
-	varName = strings.TrimPrefix(varName, "@@")
-	varName = strings.TrimPrefix(varName, "SESSION.")
-	varName = strings.TrimPrefix(varName, "session.")
-
-	if strings.HasPrefix(varName, "@") {
-		sessionVars[varName] = varValue
-		return nil
-	}
 
 	sessionVars[varName] = varValue
 	return nil

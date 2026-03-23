@@ -185,7 +185,8 @@ func (g *PGGenerator) PostProcess(sql string) string {
 	sql = strings.ReplaceAll(sql, " SIGNED", "")
 
 	// Fix UNIQUE KEY/INDEX -> UNIQUE (PostgreSQL syntax)
-	// TiDB parser generates "UNIQUE KEY" or "UNIQUE INDEX" but PostgreSQL only accepts "UNIQUE"
+	// Note: constraint names are cleared at AST level in visitCreateTable(),
+	// but TiDB RestoreSQL may still output "UNIQUE KEY" or "UNIQUE INDEX"
 	sql = strings.ReplaceAll(sql, "UNIQUE KEY", "UNIQUE")
 	sql = strings.ReplaceAll(sql, "UNIQUE INDEX", "UNIQUE")
 
@@ -197,6 +198,10 @@ func (g *PGGenerator) PostProcess(sql string) string {
 	sql = strings.ReplaceAll(sql, "CURRENT_TIMESTAMP()", "CURRENT_TIMESTAMP")
 	sql = strings.ReplaceAll(sql, "CURRENT_DATE()", "CURRENT_DATE")
 	sql = strings.ReplaceAll(sql, "CURRENT_TIME()", "CURRENT_TIME")
+
+	// Convert IF(cond, true, false) → CASE WHEN cond THEN true ELSE false END
+	// Cannot be done at AST level because TiDB visitor doesn't allow node type change
+	sql = g.convertIFFunction(sql)
 
 	// Convert AUTO_INCREMENT to SERIAL types
 	// NOTE: For CREATE TABLE, AUTO_INCREMENT is handled at AST level in visitCreateTable()
@@ -217,6 +222,8 @@ func (g *PGGenerator) PostProcess(sql string) string {
 	// sql = g.removeIndexClauses(sql)
 
 	// Remove MySQL-specific table options (ENGINE, CHARSET, etc.)
+	// Note: Most options are now removed at AST level in visitCreateTable(),
+	// this is kept as fallback for edge cases or ALTER TABLE
 	sql = g.removeTableOptions(sql)
 
 	// Convert MATCH...AGAINST to to_tsvector/to_tsquery
@@ -230,17 +237,15 @@ func (g *PGGenerator) PostProcess(sql string) string {
 	// MySQL: LIMIT offset, count → PostgreSQL: LIMIT count OFFSET offset
 	sql = g.convertLimitSyntax(sql)
 
-	// Convert MySQL lock syntax to PostgreSQL syntax
-	// MySQL: LOCK IN SHARE MODE → PostgreSQL: FOR SHARE
-	sql = strings.ReplaceAll(sql, "LOCK IN SHARE MODE", "FOR SHARE")
+	// Note: LOCK IN SHARE MODE is already converted to FOR SHARE by TiDB parser at parse time
 
 	// Fix implicit cross join syntax from TiDB parser
 	// TiDB outputs: FROM ("table1") JOIN "table2" WHERE ...
 	// PostgreSQL requires: FROM "table1", "table2" WHERE ... (or CROSS JOIN with explicit ON)
 	sql = g.fixImplicitCrossJoin(sql)
 
-	// Convert MySQL LAST_INSERT_ID() to PostgreSQL lastval()
-	// MySQL: LAST_INSERT_ID() → PostgreSQL: lastval()
+	// Note: LAST_INSERT_ID() → lastval() is now handled at AST level in functionMap
+	// Keep as fallback for edge cases where AST visitor may not visit (e.g., subqueries)
 	sql = strings.ReplaceAll(sql, "LAST_INSERT_ID()", "lastval()")
 
 	// Convert MySQL GROUP_CONCAT to PostgreSQL string_agg
@@ -250,13 +255,104 @@ func (g *PGGenerator) PostProcess(sql string) string {
 	// Remove unsupported type length parameters (e.g., SMALLINT(1) -> SMALLINT)
 	sql = g.removeUnsupportedTypeLengths(sql)
 
-	// Remove ZEROFILL keyword (PostgreSQL doesn't support it)
+	// Note: ZEROFILL flag is now cleared at AST level in convertColumnType()
+	// Keep as fallback for edge cases
 	sql = strings.ReplaceAll(sql, " ZEROFILL", "")
 
 	// Convert MySQL's || string concatenation to PostgreSQL format
 	// Note: This is already handled at AST level, this is just a backup
 
 	return sql
+}
+
+// convertIFFunction converts MySQL IF(cond, true_val, false_val) to PostgreSQL CASE WHEN cond THEN true_val ELSE false_val END
+func (g *PGGenerator) convertIFFunction(sql string) string {
+	result := sql
+	searchPos := 0
+
+	for {
+		upperPart := strings.ToUpper(result[searchPos:])
+		ifIdx := strings.Index(upperPart, "IF(")
+		if ifIdx == -1 {
+			break
+		}
+		ifIdx += searchPos
+
+		// Make sure IF is not part of a longer word (e.g., IFNULL)
+		if ifIdx > 0 {
+			prev := result[ifIdx-1]
+			if (prev >= 'A' && prev <= 'Z') || (prev >= 'a' && prev <= 'z') || prev == '_' {
+				searchPos = ifIdx + 3
+				continue
+			}
+		}
+
+		// Check if inside a string
+		if g.isInString(result, ifIdx) {
+			searchPos = ifIdx + 3
+			continue
+		}
+
+		parenStart := ifIdx + 2 // position of '('
+		parenEnd := g.findMatchingParen(result, parenStart)
+		if parenEnd == -1 {
+			searchPos = ifIdx + 3
+			continue
+		}
+
+		content := result[parenStart+1 : parenEnd]
+
+		// Split into 3 args respecting nested parens and strings
+		args := g.splitFuncArgs(content)
+		if len(args) != 3 {
+			searchPos = ifIdx + 3
+			continue
+		}
+
+		caseExpr := fmt.Sprintf("CASE WHEN %s THEN %s ELSE %s END",
+			strings.TrimSpace(args[0]),
+			strings.TrimSpace(args[1]),
+			strings.TrimSpace(args[2]))
+
+		result = result[:ifIdx] + caseExpr + result[parenEnd+1:]
+		searchPos = ifIdx + len(caseExpr)
+	}
+
+	return result
+}
+
+// splitFuncArgs splits function arguments by comma, respecting nested parens and strings
+func (g *PGGenerator) splitFuncArgs(content string) []string {
+	var args []string
+	depth := 0
+	inStr := false
+	strChar := byte(0)
+	start := 0
+
+	for i := 0; i < len(content); i++ {
+		ch := content[i]
+		if inStr {
+			if ch == strChar {
+				inStr = false
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			inStr = true
+			strChar = ch
+			continue
+		}
+		if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+		} else if ch == ',' && depth == 0 {
+			args = append(args, content[start:i])
+			start = i + 1
+		}
+	}
+	args = append(args, content[start:])
+	return args
 }
 
 // convertLimitSyntax converts MySQL LIMIT offset, count to PostgreSQL LIMIT count OFFSET offset
