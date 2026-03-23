@@ -505,126 +505,160 @@ The proxy automatically handles the following MySQL to PostgreSQL conversions:
 ### SQL Syntax Support
 
 #### DDL (Data Definition Language)
-- ✅ CREATE TABLE (supports AUTO_INCREMENT, PRIMARY KEY, UNIQUE, INDEX, ENGINE/CHARSET removed at AST level)
-- ✅ DROP TABLE [IF EXISTS]
-- ✅ ALTER TABLE (ADD/DROP COLUMN, ADD/DROP INDEX)
-- ✅ CREATE INDEX
-- ✅ DROP INDEX
-- ✅ TRUNCATE TABLE
+
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4` | `CREATE TABLE "t" ("id" SERIAL PRIMARY KEY, "name" VARCHAR(100))` |
+| `CREATE TABLE t (id BIGINT AUTO_INCREMENT PRIMARY KEY)` | `CREATE TABLE "t" ("id" BIGSERIAL PRIMARY KEY)` |
+| `CREATE TABLE t (..., INDEX idx_name (name))` | `CREATE TABLE "t" (...)` (inline INDEX removed, use CREATE INDEX separately) |
+| `CREATE TABLE t (..., UNIQUE KEY uk_email (email))` | `CREATE TABLE "t" (..., UNIQUE ("email"))` |
+| `DROP TABLE t` | `DROP TABLE "t"` |
+| `DROP TABLE IF EXISTS t` | `DROP TABLE IF EXISTS "t"` |
+| `ALTER TABLE t ADD COLUMN age INT` | `ALTER TABLE "t" ADD COLUMN "age" INT` |
+| `ALTER TABLE t DROP COLUMN age` | `ALTER TABLE "t" DROP COLUMN "age"` |
+| `CREATE INDEX idx_name ON t(name)` | `CREATE INDEX idx_name ON "t"("name")` |
+| `DROP INDEX idx_name` | `DROP INDEX idx_name` |
+| `TRUNCATE TABLE t` | `TRUNCATE TABLE "t"` |
 
 #### DML (Data Manipulation Language)
-- ✅ SELECT (supports WHERE, JOIN, GROUP BY, HAVING, ORDER BY, LIMIT)
-- ✅ INSERT (supports single and batch inserts)
-- ✅ UPDATE (supports WHERE conditions)
-- ✅ DELETE (supports WHERE conditions)
-- ✅ REPLACE INTO (converted to INSERT ... ON CONFLICT)
-- ✅ INSERT ... ON DUPLICATE KEY UPDATE (converted to ON CONFLICT)
+
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `SELECT * FROM t WHERE id = ?` | `SELECT * FROM "t" WHERE "id" = $1` |
+| `INSERT INTO t (name) VALUES (?)` | `INSERT INTO "t" ("name") VALUES ($1) RETURNING id` (with AUTO_INCREMENT) |
+| `INSERT INTO t VALUES (NULL, 'a')` | `INSERT INTO "t" VALUES (DEFAULT, 'a')` (NULL→DEFAULT for SERIAL) |
+| `INSERT INTO t (a,b) VALUES (1,2),(3,4)` | `INSERT INTO "t" ("a","b") VALUES ($1,$2),($3,$4)` |
+| `UPDATE t SET name = ? WHERE id = ?` | `UPDATE "t" SET "name" = $1 WHERE "id" = $2` |
+| `DELETE FROM t WHERE id = ?` | `DELETE FROM "t" WHERE "id" = $1` |
+| `REPLACE INTO t (id, name) VALUES (1, 'a')` | `INSERT INTO "t" ("id","name") VALUES ($1,$2) ON CONFLICT DO UPDATE SET ...` |
+| `INSERT INTO t ... ON DUPLICATE KEY UPDATE name = VALUES(name)` | `INSERT INTO "t" ... ON CONFLICT ... DO UPDATE SET "name" = EXCLUDED."name"` |
+| `SELECT LAST_INSERT_ID()` | `SELECT lastval()` |
 
 #### Transaction Control
-- ✅ BEGIN / START TRANSACTION
-- ✅ COMMIT
-- ✅ ROLLBACK
-- ✅ AUTOCOMMIT settings
-- ✅ SET TRANSACTION ISOLATION LEVEL
 
-#### Data Type Support
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `BEGIN` | `BEGIN` |
+| `START TRANSACTION` | `BEGIN` |
+| `COMMIT` | `COMMIT` |
+| `ROLLBACK` | `ROLLBACK` |
+| `SET AUTOCOMMIT = 0` | Proxy manages explicit BEGIN/COMMIT |
+| `SET AUTOCOMMIT = 1` | Proxy stops explicit transaction management |
+| `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` | `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` |
 
-**Integer Types** (AST-level conversion):
-- ✅ `TINYINT` → `SMALLINT`
-- ✅ `TINYINT UNSIGNED` → `SMALLINT`
-- ✅ `SMALLINT` → `SMALLINT`
-- ✅ `SMALLINT UNSIGNED` → `INTEGER`
-- ✅ `MEDIUMINT` → `INTEGER`
-- ✅ `INT` / `INTEGER` → `INTEGER`
-- ✅ `INT UNSIGNED` → `BIGINT`
-- ✅ `BIGINT` → `BIGINT`
-- ✅ `BIGINT UNSIGNED` → `NUMERIC(20,0)`
-- ✅ `YEAR` → `SMALLINT`
+#### Data Type Conversion
 
-**Floating-Point Types**:
-- ✅ `FLOAT` → `REAL`
-- ✅ `DOUBLE` → `DOUBLE PRECISION` (String-level)
-- ✅ `DECIMAL(M,D)` / `NUMERIC(M,D)` → `NUMERIC(M,D)`
+| MySQL Type | PostgreSQL Type | Level |
+|-----------|----------------|-------|
+| `TINYINT` | `SMALLINT` | AST |
+| `TINYINT UNSIGNED` | `SMALLINT` | AST |
+| `SMALLINT` | `SMALLINT` | AST |
+| `SMALLINT UNSIGNED` | `INTEGER` | AST |
+| `MEDIUMINT` | `INTEGER` | AST |
+| `INT` / `INTEGER` | `INTEGER` | AST |
+| `INT UNSIGNED` | `BIGINT` | AST |
+| `BIGINT` | `BIGINT` | AST |
+| `BIGINT UNSIGNED` | `NUMERIC(20,0)` | AST |
+| `YEAR` | `SMALLINT` | AST |
+| `FLOAT` | `REAL` | AST |
+| `DOUBLE` | `DOUBLE PRECISION` | String |
+| `DECIMAL(M,D)` | `NUMERIC(M,D)` | AST |
+| `CHAR(N)` | `CHAR(N)` | Direct |
+| `VARCHAR(N)` | `VARCHAR(N)` | Direct |
+| `TEXT` | `TEXT` | Direct |
+| `TINYTEXT` | `TEXT` | String |
+| `MEDIUMTEXT` | `TEXT` | String |
+| `LONGTEXT` | `TEXT` | String |
+| `BLOB` | `BYTEA` | String |
+| `TINYBLOB` | `BYTEA` | AST |
+| `MEDIUMBLOB` | `BYTEA` | AST |
+| `LONGBLOB` | `BYTEA` | AST |
+| `DATE` | `DATE` | Direct |
+| `TIME` | `TIME` | Direct |
+| `DATETIME` | `TIMESTAMP` | AST |
+| `TIMESTAMP` | `TIMESTAMP WITH TIME ZONE` | AST |
+| `JSON` | `JSONB` | String |
+| `ENUM('a','b','c')` | `VARCHAR(50)` | AST |
+| `BOOLEAN` / `TINYINT(1)` | `BOOLEAN` | AST |
+| `BIT(N)` | `BIT(N)` | Direct |
+| `INT AUTO_INCREMENT` | `SERIAL` | AST+String |
+| `BIGINT AUTO_INCREMENT` | `BIGSERIAL` | AST+String |
+| `INT UNSIGNED ZEROFILL` | `BIGINT` (ZEROFILL removed) | AST |
 
-**String Types**:
-- ✅ `CHAR(N)` → `CHAR(N)`
-- ✅ `VARCHAR(N)` → `VARCHAR(N)`
-- ✅ `TEXT` → `TEXT`
-- ✅ `TINYTEXT` → `TEXT` (String-level)
-- ✅ `MEDIUMTEXT` → `TEXT` (String-level)
-- ✅ `LONGTEXT` → `TEXT` (String-level)
+#### Function Conversion
 
-**Binary Types** (Hybrid AST + String):
-- ✅ `BLOB` → `BYTEA`
-- ✅ `TINYBLOB` → `BYTEA` (via BLOB)
-- ✅ `MEDIUMBLOB` → `BYTEA` (via BLOB)
-- ✅ `LONGBLOB` → `BYTEA` (via BLOB)
+| MySQL Function | PostgreSQL Function | Level |
+|---------------|-------------------|-------|
+| `NOW()` | `CURRENT_TIMESTAMP` | AST |
+| `CURDATE()` | `CURRENT_DATE` | AST |
+| `CURTIME()` | `CURRENT_TIME` | AST |
+| `UNIX_TIMESTAMP()` | `EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)` | AST |
+| `FROM_UNIXTIME(ts)` | `TO_TIMESTAMP(ts)` | AST |
+| `DATE_FORMAT(d, fmt)` | `TO_CHAR(d, fmt)` | AST |
+| `STR_TO_DATE(s, fmt)` | `TO_DATE(s, fmt)` | AST |
+| `LAST_INSERT_ID()` | `lastval()` | AST |
+| `CONCAT(a, b, ...)` | `CONCAT(a, b, ...)` | Direct |
+| `CONCAT_WS(sep, a, b)` | `CONCAT_WS(sep, a, b)` | Direct |
+| `LENGTH(s)` | `LENGTH(s)` | Direct |
+| `CHAR_LENGTH(s)` | `CHAR_LENGTH(s)` | Direct |
+| `SUBSTRING(s, pos, len)` | `SUBSTRING(s, pos, len)` | Direct |
+| `UPPER(s)` / `LOWER(s)` | `UPPER(s)` / `LOWER(s)` | Direct |
+| `TRIM(s)` / `LTRIM(s)` / `RTRIM(s)` | `TRIM(s)` / `LTRIM(s)` / `RTRIM(s)` | Direct |
+| `REPLACE(s, from, to)` | `REPLACE(s, from, to)` | Direct |
+| `LOCATE(sub, s)` | `POSITION(sub IN s)` | AST |
+| `ABS(n)` / `CEIL(n)` / `FLOOR(n)` / `ROUND(n)` | Same | Direct |
+| `MOD(n, m)` | `MOD(n, m)` | Direct |
+| `POWER(n, m)` / `POW(n, m)` | `POWER(n, m)` | AST |
+| `SQRT(n)` | `SQRT(n)` | Direct |
+| `RAND()` | `RANDOM()` | AST |
+| `COUNT(*)` / `SUM()` / `AVG()` / `MAX()` / `MIN()` | Same | Direct |
+| `GROUP_CONCAT(col SEPARATOR ',')` | `STRING_AGG(col::TEXT, ',')` | AST+String |
+| `IF(cond, a, b)` | `CASE WHEN cond THEN a ELSE b END` | String |
+| `IFNULL(a, b)` | `COALESCE(a, b)` | AST |
+| `NULLIF(a, b)` | `NULLIF(a, b)` | Direct |
+| `COALESCE(a, b, ...)` | `COALESCE(a, b, ...)` | Direct |
+| `CAST(x AS type)` | `CAST(x AS type)` | Direct |
+| `JSON_ARRAY(a, b)` | `JSON_BUILD_ARRAY(a, b)` | AST |
+| `JSON_OBJECT(k, v)` | `JSON_BUILD_OBJECT(k, v)` | AST |
+| `MATCH(col) AGAINST('term')` | `to_tsvector('simple', col) @@ to_tsquery('simple', 'term')` | String |
 
-**Date/Time Types** (AST-level):
-- ✅ `DATE` → `DATE`
-- ✅ `TIME` → `TIME`
-- ✅ `DATETIME` → `TIMESTAMP`
-- ✅ `TIMESTAMP` → `TIMESTAMP WITH TIME ZONE`
+#### Query Syntax Conversion
 
-**Special Types**:
-- ✅ `JSON` → `JSONB` (String-level)
-- ✅ `ENUM(...)` → `VARCHAR(50)` (AST-level)
-- ✅ `BOOLEAN` / `TINYINT(1)` → `BOOLEAN` (AST-level)
-
-#### Function Support
-
-All function conversions are handled at **AST level** for semantic correctness.
-
-**Date/Time Functions**:
-- ✅ `NOW()` → `CURRENT_TIMESTAMP`
-- ✅ `CURDATE()` / `CURRENT_DATE()` → `CURRENT_DATE`
-- ✅ `CURTIME()` / `CURRENT_TIME()` → `CURRENT_TIME`
-- ✅ `UNIX_TIMESTAMP()` → `EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)`
-
-**String Functions**:
-- ✅ `CONCAT(a, b, ...)` → `CONCAT(a, b, ...)`
-- ✅ `CONCAT_WS(sep, a, b, ...)` → `CONCAT_WS(sep, a, b, ...)`
-- ✅ `LENGTH(s)` → `LENGTH(s)`
-- ✅ `CHAR_LENGTH(s)` → `CHAR_LENGTH(s)`
-- ✅ `SUBSTRING(s, pos, len)` → `SUBSTRING(s, pos, len)`
-- ✅ `UPPER(s)` / `LOWER(s)` → `UPPER(s)` / `LOWER(s)`
-- ✅ `TRIM(s)` / `LTRIM(s)` / `RTRIM(s)` → `TRIM(s)` / `LTRIM(s)` / `RTRIM(s)`
-- ✅ `REPLACE(s, from, to)` → `REPLACE(s, from, to)`
-
-**Math Functions**:
-- ✅ `ABS(n)`, `CEIL(n)`, `FLOOR(n)`, `ROUND(n)` → Same
-- ✅ `MOD(n, m)` → `MOD(n, m)`
-- ✅ `POWER(n, m)` / `POW(n, m)` → `POWER(n, m)`
-- ✅ `SQRT(n)` → `SQRT(n)`
-- ✅ `RAND()` → `RANDOM()`
-
-**Aggregate Functions**:
-- ✅ `COUNT(*)` / `COUNT(col)` → Same
-- ✅ `SUM(col)`, `AVG(col)`, `MAX(col)`, `MIN(col)` → Same
-- ✅ `GROUP_CONCAT(col)` → `STRING_AGG(col::TEXT, ',')`
-
-**Conditional Functions**:
-- ✅ `IF(cond, a, b)` → `CASE WHEN cond THEN a ELSE b END`
-- ✅ `IFNULL(a, b)` → `COALESCE(a, b)`
-- ✅ `NULLIF(a, b)` → `NULLIF(a, b)`
-- ✅ `COALESCE(a, b, c, ...)` → Same
-
-#### Query Features
-- ✅ INNER JOIN
-- ✅ LEFT JOIN / RIGHT JOIN
-- ✅ Subqueries (IN, EXISTS)
-- ✅ GROUP BY with HAVING
-- ✅ ORDER BY
-- ✅ LIMIT offset, count (auto-converted to LIMIT count OFFSET offset)
-- ✅ DISTINCT
-- ✅ UNION / UNION ALL
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `` SELECT `id`, `name` FROM `users` `` | `SELECT "id", "name" FROM "users"` |
+| `SELECT * FROM t LIMIT 5, 10` | `SELECT * FROM "t" LIMIT 10 OFFSET 5` |
+| `SELECT * FROM t LIMIT 10` | `SELECT * FROM "t" LIMIT 10` |
+| `SELECT * FROM t FOR UPDATE` | `SELECT * FROM "t" FOR UPDATE` |
+| `SELECT * FROM t FOR UPDATE SKIP LOCKED` | `SELECT * FROM "t" FOR UPDATE SKIP LOCKED` |
+| `SELECT * FROM t LOCK IN SHARE MODE` | `SELECT * FROM "t" FOR SHARE` |
+| `SELECT * FROM a INNER JOIN b ON a.id = b.aid` | `SELECT * FROM "a" INNER JOIN "b" ON "a"."id" = "b"."aid"` |
+| `SELECT * FROM a LEFT JOIN b ON a.id = b.aid` | `SELECT * FROM "a" LEFT JOIN "b" ON "a"."id" = "b"."aid"` |
+| `SELECT * FROM a RIGHT JOIN b ON a.id = b.aid` | `SELECT * FROM "a" RIGHT JOIN "b" ON "a"."id" = "b"."aid"` |
+| `SELECT * FROM t WHERE id IN (SELECT aid FROM b)` | `SELECT * FROM "t" WHERE "id" IN (SELECT "aid" FROM "b")` |
+| `SELECT * FROM t WHERE EXISTS (SELECT 1 FROM b)` | `SELECT * FROM "t" WHERE EXISTS (SELECT 1 FROM "b")` |
+| `SELECT name, COUNT(*) FROM t GROUP BY name HAVING COUNT(*) > 1` | `SELECT "name", COUNT(*) FROM "t" GROUP BY "name" HAVING COUNT(*) > 1` |
+| `SELECT DISTINCT name FROM t` | `SELECT DISTINCT "name" FROM "t"` |
+| `SELECT name FROM t1 UNION ALL SELECT name FROM t2` | `SELECT "name" FROM "t1" UNION ALL SELECT "name" FROM "t2"` |
+| `SELECT * FROM t WHERE id = ? AND name = ?` | `SELECT * FROM "t" WHERE "id" = $1 AND "name" = $2` |
+| `_UTF8MB4'text'` | `'text'` (charset prefix removed) |
 
 #### Other Features
-- ✅ Prepared Statements
-- ✅ Batch Operations
-- ✅ NULL value handling
-- ✅ Indexes and constraints (PRIMARY KEY, UNIQUE, INDEX)
-- ✅ LastInsertId() support (via RETURNING clause)
+
+| MySQL | PostgreSQL | Notes |
+|-------|-----------|-------|
+| Prepared Statements (`COM_PREPARE` / `COM_STMT_EXECUTE`) | `$1, $2, ...` placeholders | Binary protocol supported |
+| Batch INSERT `VALUES (...),(...),...` | Same | Direct pass-through |
+| `NULL` in SERIAL column | `DEFAULT` | Auto-converted for AUTO_INCREMENT columns |
+| `PRIMARY KEY` | `PRIMARY KEY` | Direct |
+| `UNIQUE KEY uk_name (col)` | `UNIQUE ("col")` | Constraint name removed |
+| `INDEX idx_name (col)` | Removed from CREATE TABLE | Must use `CREATE INDEX` separately |
+| `ENGINE=InnoDB` | Removed | PG has no storage engine concept |
+| `DEFAULT CHARSET=utf8mb4` | Removed | PG always uses UTF-8 |
+| `AUTO_INCREMENT=100` (table option) | Removed | PG SERIAL manages its own sequence |
+| `UNSIGNED` | Type promoted (INT→BIGINT) | AST-level |
+| `ZEROFILL` | Removed | AST-level |
+| `SIGNED` keyword | Removed | String-level |
 
 ## CDC (Change Data Capture)
 
