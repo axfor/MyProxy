@@ -362,14 +362,27 @@ func (se *ShowEmulator) showVariables(ctx context.Context, conn *pgx.Conn, sql s
 		if len(parts) > 1 {
 			pattern := strings.TrimSpace(parts[1])
 			pattern = strings.Trim(pattern, "'\"")
-			pattern = strings.ReplaceAll(pattern, "%", "%%")
+			cleanPattern := strings.ReplaceAll(pattern, "%", "")
 
+			// Try variable mapping table first
+			if cleanPattern != "" {
+				if value, found, err := GetMySQLVarValue(ctx, conn, cleanPattern); found {
+					if err != nil {
+						return nil, err
+					}
+					query := fmt.Sprintf(`SELECT '%s' AS "Variable_name", '%s' AS "Value"`, cleanPattern, value)
+					return conn.Query(ctx, query)
+				}
+			}
+
+			// Fallback to pg_settings
+			pgPattern := strings.ReplaceAll(pattern, "%", "%%")
 			query := fmt.Sprintf(`
 				SELECT name AS "Variable_name", setting AS "Value"
 				FROM pg_settings
 				WHERE name LIKE '%s'
 				ORDER BY name
-			`, pattern)
+			`, pgPattern)
 			return conn.Query(ctx, query)
 		}
 	}
@@ -510,7 +523,16 @@ func (se *ShowEmulator) showGlobalVariables(ctx context.Context, conn *pgx.Conn,
 			pattern = strings.ToLower(pattern)
 			pattern = strings.ReplaceAll(pattern, "%", "")
 
-			// Return MySQL-compatible values for binlog replication
+			// Look up in variable mapping table first
+			if value, found, err := GetMySQLVarValue(ctx, conn, pattern); found {
+				if err != nil {
+					return nil, err
+				}
+				query := fmt.Sprintf(`SELECT '%s' AS "Variable_name", '%s' AS "Value"`, pattern, value)
+				return conn.Query(ctx, query)
+			}
+
+			// Fallback: hardcoded binlog replication variables
 			switch pattern {
 			case "binlog_format":
 				return conn.Query(ctx, `SELECT 'binlog_format' AS "Variable_name", 'ROW' AS "Value"`)

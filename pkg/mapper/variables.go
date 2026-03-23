@@ -196,6 +196,12 @@ var mysqlToPostgresVars = map[string]VarMapping{
 		StaticValue: "",
 	},
 
+	// Binlog variables (static compatibility values)
+	"binlog_format":    {Scope: ScopeInternal, StaticValue: "ROW"},
+	"binlog_row_image": {Scope: ScopeInternal, StaticValue: "FULL"},
+	"log_bin":          {Scope: ScopeInternal, StaticValue: "ON"},
+	"binlog_checksum":  {Scope: ScopeInternal, StaticValue: "CRC32"},
+
 	// GTID variables (PG uses LSN, these are compatibility stubs)
 	"gtid_mode": {
 		Scope:       ScopeInternal,
