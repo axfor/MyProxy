@@ -13,11 +13,12 @@ import (
 )
 
 // getE2EDSN returns the DSN for e2e tests.
+// Uses MYPROXY_DSN env var, or defaults to config-e2e.yaml credentials.
 func getE2EDSN() string {
 	if dsn := os.Getenv("MYPROXY_DSN"); dsn != "" {
 		return dsn
 	}
-	return proxyDSN
+	return "myproxy:myproxy@tcp(localhost:13306)/test?parseTime=true"
 }
 
 func setupAdminDB(tb testing.TB) (*sql.DB, func()) {

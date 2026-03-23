@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"reflect"
 	"strings"
 	"time"
 
@@ -33,14 +32,11 @@ type Handler struct {
 	typeMapper       *mapper.TypeMapper
 	errorMapper      *mapper.ErrorMapper
 	showEmulator     *mapper.ShowEmulator
-	replAdmin        *admin.ReplicationAdmin
-	metrics          *observability.Metrics
-	logger           *observability.Logger
-	debugSQL         bool
-	connectionMode   pool.ConnectionMode
-	schemaResolver   *schema.Resolver
-	fallbackToPublic bool
-	replServer       *replication.Server // MySQL binlog replication server
+	replAdmin  *admin.ReplicationAdmin
+	metrics    *observability.Metrics
+	logger     *observability.Logger
+	debugSQL   bool
+	replServer *replication.Server // MySQL binlog replication server
 }
 
 func NewHandler(
@@ -60,46 +56,17 @@ func NewHandler(
 		typeMapper:       mapper.NewTypeMapper(),
 		errorMapper:      mapper.NewErrorMapper(),
 		showEmulator:     mapper.NewShowEmulator(),
-		replAdmin:        admin.NewReplicationAdmin(),
-		metrics:          metrics,
-		logger:           logger,
-		debugSQL:         debugSQL,
-		connectionMode:   inferConnectionMode(pgPool),
-		schemaResolver:   schema.NewResolver(schema.MappingConfig{DefaultSchema: "public"}),
-		fallbackToPublic: false,
-		replServer:       replServer,
+		replAdmin:  admin.NewReplicationAdmin(),
+		metrics:    metrics,
+		logger:     logger,
+		debugSQL:   debugSQL,
+		replServer: replServer,
 	}
-}
-
-func inferConnectionMode(pgPool *pool.Pool) pool.ConnectionMode {
-	if pgPool == nil {
-		return pool.ModeSessionAffinity
-	}
-
-	value := reflect.ValueOf(pgPool)
-	if value.Kind() != reflect.Pointer || value.IsNil() {
-		return pool.ModeSessionAffinity
-	}
-
-	modeField := value.Elem().FieldByName("mode")
-	if !modeField.IsValid() || modeField.Kind() != reflect.String {
-		return pool.ModeSessionAffinity
-	}
-
-	return pool.ConnectionMode(modeField.String())
 }
 
 // SetReplicationServer sets the replication server for handling COM_BINLOG_DUMP
 func (h *Handler) SetReplicationServer(server *replication.Server) {
 	h.replServer = server
-}
-
-func (h *Handler) SetShowDatabasesConfig(exposureConfig mapper.DatabaseExposureConfig, mappingConfig schema.MappingConfig) {
-	if h.showEmulator == nil {
-		h.showEmulator = mapper.NewShowEmulator()
-	}
-
-	h.showEmulator.ConfigureShowDatabases(exposureConfig, mappingConfig)
 }
 
 func (h *Handler) NewConnection(conn net.Conn) (server.Handler, error) {
@@ -118,58 +85,63 @@ func (h *Handler) NewConnection(conn net.Conn) (server.Handler, error) {
 }
 
 type ConnectionHandler struct {
-	handler *Handler
-	session *session.Session
-	conn    net.Conn
-	pgConn  *pgx.Conn
+	handler        *Handler
+	session        *session.Session
+	conn           net.Conn
+	pgConn         *pgx.Conn
+	searchPathSet  bool // true after SET search_path has been executed
+}
+
+// ensurePGConn acquires a PostgreSQL connection if not already connected,
+// and applies SET search_path based on the MySQL session's current database.
+// This is the single entry point for all connection acquisition.
+func (ch *ConnectionHandler) ensurePGConn(ctx context.Context) error {
+	if ch.pgConn == nil {
+		conn, err := ch.handler.pgPool.AcquireForSession(ctx, ch.session.ID)
+		if err != nil {
+			ch.handler.metrics.IncErrors("connection")
+			ch.handler.logger.LogError(ch.session.ID, ch.session.User, ch.session.ClientAddr, "connection", err)
+			return err
+		}
+		ch.pgConn = conn
+		ch.session.SetPGConn(conn)
+		ch.searchPathSet = false
+	}
+
+	// Apply search_path if not yet set for this connection
+	if !ch.searchPathSet {
+		dbName := ch.session.Database
+		if dbName == "" {
+			// Default: use "public" schema when client didn't specify a database
+			dbName = "public"
+		}
+		// Include public as fallback so tables in public schema are always accessible
+		if _, err := ch.pgConn.Exec(ctx, fmt.Sprintf("SET search_path TO %s", dbName)); err != nil {
+			return fmt.Errorf("failed to set search_path to %s: %w", dbName, err)
+		}
+		ch.searchPathSet = true
+	}
+
+	return nil
 }
 
 func (ch *ConnectionHandler) UseDB(dbName string) error {
-	if ch.handler.connectionMode != pool.ModeSessionAffinity {
-		return mysql.NewError(mysql.ER_UNKNOWN_ERROR, fmt.Sprintf("current connection mode %s does not support USE db / COM_INIT_DB semantics", ch.handler.connectionMode))
-	}
-
 	if ch.session.InTransaction {
 		return mysql.NewError(mysql.ER_UNKNOWN_ERROR, "cannot change database while transaction is active")
 	}
 
-	if ch.pgConn != nil {
-		return ch.switchSchema(context.Background(), ch.pgConn, dbName)
-	}
-
 	ch.session.Database = dbName
+	ch.searchPathSet = false // force re-apply on next query
+
+	if ch.pgConn != nil {
+		ctx := context.Background()
+		if _, err := ch.pgConn.Exec(ctx, fmt.Sprintf("SET search_path TO %s", dbName)); err != nil {
+			return err
+		}
+		ch.searchPathSet = true
+	}
+
 	return nil
-}
-
-func (ch *ConnectionHandler) switchSchema(ctx context.Context, executor schema.SearchPathExecutor, dbName string) error {
-	resolver := ch.handler.schemaResolver
-	if resolver == nil {
-		resolver = schema.NewResolver(schema.MappingConfig{DefaultSchema: "public"})
-	}
-
-	schemaName, err := resolver.ResolveSchema(dbName)
-	if err != nil {
-		return err
-	}
-
-	if err := schema.ApplySchema(ctx, executor, schemaName, ch.handler.fallbackToPublic); err != nil {
-		return err
-	}
-
-	ch.session.SetCurrentSchema(schemaName)
-	return nil
-}
-
-func (ch *ConnectionHandler) applyInitialSchema(ctx context.Context, executor schema.SearchPathExecutor) error {
-	if ch.session.Database == "" || ch.session.CurrentSchema == ch.session.Database {
-		return nil
-	}
-
-	if ch.handler.connectionMode != pool.ModeSessionAffinity {
-		return mysql.NewError(mysql.ER_UNKNOWN_ERROR, fmt.Sprintf("current connection mode %s does not support USE db / COM_INIT_DB semantics", ch.handler.connectionMode))
-	}
-
-	return ch.switchSchema(ctx, executor, ch.session.Database)
 }
 
 func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
@@ -182,18 +154,8 @@ func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
 
 	ctx := context.Background()
 
-	if ch.pgConn == nil {
-		conn, err := ch.handler.pgPool.AcquireForSession(ctx, ch.session.ID)
-		if err != nil {
-			ch.handler.metrics.IncErrors("connection")
-			ch.handler.logger.LogError(ch.session.ID, ch.session.User, ch.session.ClientAddr, "connection", err)
-			return nil, err
-		}
-		ch.pgConn = conn
-		ch.session.SetPGConn(conn)
-		if err := ch.applyInitialSchema(ctx, conn); err != nil {
-			return nil, err
-		}
+	if err := ch.ensurePGConn(ctx); err != nil {
+		return nil, err
 	}
 
 	if ch.handler.rewriter.IsShowStatement(query) {
@@ -419,7 +381,7 @@ func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
 				tableName := extractCreateTableName(query)
 
 				// Invalidate cache for the new table (it will be refreshed on first INSERT)
-				schema.GetGlobalCache().InvalidateTable(ch.session.CurrentSchema, tableName)
+				schema.GetGlobalCache().InvalidateTable(ch.session.Database, tableName)
 
 				// Also mark in session for backward compatibility
 				columnName := extractAutoIncrementColumn(query)
@@ -430,13 +392,13 @@ func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
 				// ALTER TABLE may change AUTO_INCREMENT columns
 				tableName := extractAlterTableName(query)
 				if tableName != "" {
-					schema.GetGlobalCache().InvalidateTable(ch.session.CurrentSchema, tableName)
+					schema.GetGlobalCache().InvalidateTable(ch.session.Database, tableName)
 				}
 			} else if strings.HasPrefix(upperQuery, "DROP TABLE") {
 				// DROP TABLE removes the table
 				tableName := extractDropTableName(query)
 				if tableName != "" {
-					schema.GetGlobalCache().InvalidateTable(ch.session.CurrentSchema, tableName)
+					schema.GetGlobalCache().InvalidateTable(ch.session.Database, tableName)
 				}
 			}
 		}
@@ -487,16 +449,8 @@ func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
 func (ch *ConnectionHandler) HandleFieldList(table string, wildcard string) ([]*mysql.Field, error) {
 	ctx := context.Background()
 
-	// Ensure we have a PostgreSQL connection
-	if ch.pgConn == nil {
-		conn, err := ch.handler.pgPool.AcquireForSession(ctx, ch.session.ID)
-		if err != nil {
-			ch.handler.metrics.IncErrors("connection")
-			ch.handler.logger.LogError(ch.session.ID, ch.session.User, ch.session.ClientAddr, "connection", err)
-			return nil, err
-		}
-		ch.pgConn = conn
-		ch.session.SetPGConn(conn)
+	if err := ch.ensurePGConn(ctx); err != nil {
+		return nil, err
 	}
 
 	query := fmt.Sprintf(`
@@ -537,16 +491,8 @@ func (ch *ConnectionHandler) HandleFieldList(table string, wildcard string) ([]*
 func (ch *ConnectionHandler) HandleStmtPrepare(query string) (int, int, interface{}, error) {
 	ctx := context.Background()
 
-	// Ensure we have a PostgreSQL connection
-	if ch.pgConn == nil {
-		conn, err := ch.handler.pgPool.AcquireForSession(ctx, ch.session.ID)
-		if err != nil {
-			ch.handler.metrics.IncErrors("connection")
-			ch.handler.logger.LogError(ch.session.ID, ch.session.User, ch.session.ClientAddr, "connection", err)
-			return 0, 0, nil, err
-		}
-		ch.pgConn = conn
-		ch.session.SetPGConn(conn)
+	if err := ch.ensurePGConn(ctx); err != nil {
+		return 0, 0, nil, err
 	}
 
 	rewrittenSQL, paramCount, err := ch.handler.rewriter.RewritePrepared(query)
@@ -600,16 +546,8 @@ func (ch *ConnectionHandler) HandleStmtExecute(data interface{}, query string, a
 
 	ctx := context.Background()
 
-	// Ensure we have a PostgreSQL connection
-	if ch.pgConn == nil {
-		conn, err := ch.handler.pgPool.AcquireForSession(ctx, ch.session.ID)
-		if err != nil {
-			ch.handler.metrics.IncErrors("connection")
-			ch.handler.logger.LogError(ch.session.ID, ch.session.User, ch.session.ClientAddr, "connection", err)
-			return nil, err
-		}
-		ch.pgConn = conn
-		ch.session.SetPGConn(conn)
+	if err := ch.ensurePGConn(ctx); err != nil {
+		return nil, err
 	}
 
 	// Check if this is a DML statement that doesn't return rows
@@ -1160,17 +1098,19 @@ func (ch *ConnectionHandler) handleSetCommand(ctx context.Context, query string)
 }
 
 func (ch *ConnectionHandler) handleUseCommand(ctx context.Context, query string) (*mysql.Result, error) {
-	err := ch.handler.showEmulator.HandleUseCommand(ctx, ch.pgConn, query)
-	if err != nil {
+	// Extract database name from USE statement
+	parts := strings.Fields(query)
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("invalid USE command: %s", query)
+	}
+	dbName := strings.Trim(parts[1], "`\"';")
+
+	// Reuse UseDB which handles schema resolution and search_path
+	if err := ch.UseDB(dbName); err != nil {
 		return nil, err
 	}
 
-	result := &mysql.Result{
-		Status:       0,
-		AffectedRows: 0,
-	}
-
-	return result, nil
+	return &mysql.Result{Status: 0}, nil
 }
 
 // handleSelectVariable intercepts SELECT @@global.xxx / SELECT @@xxx queries

@@ -152,7 +152,6 @@ func main() {
 	}
 
 	handler := my.NewHandler(pgPool, sessionMgr, rewriter, metrics, logger, cfg.SQLRewrite.DebugSQL, replServer)
-	handler.SetShowDatabasesConfig(cfg.DatabaseMapping.ToDatabaseExposureConfig(), cfg.DatabaseMapping.ToSchemaMappingConfig())
 	authUser, authPassword := frontendAuthCredentials(cfg)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)

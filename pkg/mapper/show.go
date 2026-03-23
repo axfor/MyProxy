@@ -5,53 +5,13 @@ import (
 	"fmt"
 	"strings"
 
-	schemamapping "MyProxy/pkg/schema"
 	"github.com/jackc/pgx/v5"
 )
 
-type ShowEmulator struct {
-	exposureConfig      DatabaseExposureConfig
-	mappingConfig       schemamapping.MappingConfig
-	usageCheckerFactory func(conn *pgx.Conn) SchemaUsageChecker
-}
+type ShowEmulator struct{}
 
 func NewShowEmulator() *ShowEmulator {
-	return &ShowEmulator{
-		exposureConfig: DatabaseExposureConfig{
-			ExposeMode:       ExposeModeExplicit,
-			ExposedDatabases: []string{},
-			Rules:            map[string]string{},
-		},
-		mappingConfig: schemamapping.MappingConfig{
-			DefaultSchema:    "public",
-			FallbackToPublic: false,
-			Rules:            map[string]string{},
-		},
-		usageCheckerFactory: func(conn *pgx.Conn) SchemaUsageChecker {
-			return pgSchemaUsageChecker{conn: conn}
-		},
-	}
-}
-
-func (se *ShowEmulator) ConfigureShowDatabases(exposureConfig DatabaseExposureConfig, mappingConfig schemamapping.MappingConfig) {
-	if exposureConfig.Rules == nil {
-		exposureConfig.Rules = map[string]string{}
-	}
-	if exposureConfig.ExposedDatabases == nil {
-		exposureConfig.ExposedDatabases = []string{}
-	}
-	if exposureConfig.ExposeMode == "" {
-		exposureConfig.ExposeMode = ExposeModeExplicit
-	}
-	if mappingConfig.Rules == nil {
-		mappingConfig.Rules = map[string]string{}
-	}
-	if mappingConfig.DefaultSchema == "" {
-		mappingConfig.DefaultSchema = "public"
-	}
-
-	se.exposureConfig = exposureConfig
-	se.mappingConfig = mappingConfig
+	return &ShowEmulator{}
 }
 
 func (se *ShowEmulator) HandleShowCommand(ctx context.Context, conn *pgx.Conn, sql string) (pgx.Rows, error) {
@@ -126,19 +86,13 @@ func (se *ShowEmulator) HandleShowCommand(ctx context.Context, conn *pgx.Conn, s
 }
 
 func (se *ShowEmulator) showDatabases(ctx context.Context, conn *pgx.Conn) (pgx.Rows, error) {
-	checkerFactory := se.usageCheckerFactory
-	if checkerFactory == nil {
-		checkerFactory = func(conn *pgx.Conn) SchemaUsageChecker {
-			return pgSchemaUsageChecker{conn: conn}
-		}
-	}
-
-	databases, err := ResolveAccessibleDatabases(ctx, se.exposureConfig, se.mappingConfig, checkerFactory(conn))
-	if err != nil {
-		return nil, err
-	}
-
-	return conn.Query(ctx, BuildShowDatabasesResultSQL(databases))
+	query := `
+		SELECT schema_name AS "Database"
+		FROM information_schema.schemata
+		WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+		ORDER BY schema_name
+	`
+	return conn.Query(ctx, query)
 }
 
 func (se *ShowEmulator) showTables(ctx context.Context, conn *pgx.Conn, sql string) (pgx.Rows, error) {
