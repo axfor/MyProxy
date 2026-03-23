@@ -212,8 +212,8 @@ MySQL Client Receives Response
 - ✅ **Global Schema Cache**: Generic sync.Map-based cache with DDL auto-invalidation (99% query reduction)
 - ✅ **Type Mapping**: Automatic conversion between MySQL and PostgreSQL data types
 - ✅ **Error Mapping**: Maps PostgreSQL error codes to MySQL error codes
-- ✅ **SHOW/DESCRIBE Emulation**: Simulates MySQL metadata commands, including logical `SHOW DATABASES`
-- ✅ **Connection Pooling**: Supports session affinity and pooled modes; schema mapping requires `session_affinity`
+- ✅ **SHOW/DESCRIBE Emulation**: Simulates MySQL metadata commands
+- ✅ **Connection Pooling**: Supports session affinity and pooled modes
 - ✅ **MySQL CDC (Binlog)**: Stream PostgreSQL changes as MySQL binlog events to MySQL replication clients
 - ✅ **Observability**: Prometheus metrics, structured logging, health checks
 - ✅ **High Performance**: Target 10,000+ QPS, P99 latency < 50ms
@@ -372,10 +372,53 @@ The proxy automatically handles the following MySQL to PostgreSQL conversions:
 ### Metadata Commands
 - ✅ SHOW DATABASES (returns logical database names)
 - ✅ SHOW TABLES
-- ✅ SHOW COLUMNS
+- ✅ SHOW COLUMNS / SHOW FULL COLUMNS
+- ✅ SHOW CREATE TABLE
+- ✅ SHOW INDEX
 - ✅ DESCRIBE/DESC
-- ✅ SET variables
+- ✅ SHOW STATUS / SHOW VARIABLES / SHOW WARNINGS
+- ✅ SHOW GLOBAL VARIABLES / SHOW GLOBAL STATUS
+- ✅ SET variables / SET GLOBAL variables
 - ✅ USE database
+
+### Replication Management Commands
+- ✅ START SLAVE / STOP SLAVE (incl. SQL_THREAD, IO_THREAD) → `pg_wal_replay_resume/pause()`
+- ✅ CHANGE MASTER TO → `ALTER SYSTEM SET primary_conninfo`
+- ✅ RESET SLAVE / RESET MASTER → `ALTER SYSTEM RESET` / `pg_switch_wal()`
+- ✅ SHOW SLAVE STATUS (incl. FOR CHANNEL) → `pg_stat_wal_receiver`
+- ✅ SHOW SLAVE HOSTS → `pg_stat_replication`
+- ✅ SHOW MASTER STATUS → `pg_current_wal_lsn()`
+- ✅ SHOW BINARY LOGS → `pg_ls_waldir()`
+
+### Variable Mapping (SET GLOBAL / SELECT @@)
+- ✅ `read_only` / `super_read_only` → `default_transaction_read_only`
+- ✅ `rpl_semi_sync_master_enabled` → `synchronous_commit`
+- ✅ `rpl_semi_sync_slave_enabled` → NoOp (PG automatic)
+- ✅ `max_connections` → `max_connections` (ALTER SYSTEM)
+- ✅ `wait_timeout` → `idle_in_transaction_session_timeout`
+- ✅ `foreign_key_checks` → `session_replication_role`
+- ✅ `sql_log_bin` → `log_statement`
+- ✅ `server_id` / `server_uuid` / `report_host` → internal storage
+- ✅ `gtid_purged` / `gtid_mode` / `gtid_executed` → compatibility stubs
+- ✅ `@@version` → PostgreSQL `server_version`
+
+### ACL Management (AST-based)
+- ✅ CREATE USER → `CREATE ROLE ... WITH LOGIN PASSWORD`
+- ✅ DROP USER → `DROP ROLE`
+- ✅ GRANT (SELECT, INSERT, REPLICATION SLAVE, ALL, ...) → PostgreSQL GRANT / ALTER ROLE
+- ✅ REVOKE → PostgreSQL REVOKE / ALTER ROLE
+- ✅ FLUSH PRIVILEGES → NoOp (PG immediate)
+
+### Server Administration
+- ✅ SHOW PROCESSLIST → `pg_stat_activity`
+- ✅ KILL [CONNECTION|QUERY] id → `pg_terminate_backend()` / `pg_cancel_backend()`
+- ✅ FLUSH TABLES → Acknowledged (NoOp)
+- ✅ ALTER TABLE ... DISCARD/IMPORT TABLESPACE → Error (not supported in PG)
+
+### Backup & Restore (API)
+- ✅ Physical backup (xtrabackup equivalent) → `pg_basebackup`
+- ✅ Logical backup (mysqldump equivalent) → `pg_dump`
+- ✅ Restore → `rsync` / `pg_restore`
 
 ### SQL Syntax Support
 

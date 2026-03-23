@@ -11,15 +11,15 @@ import (
 	"syscall"
 	"time"
 
-	"aproxy/internal/config"
-	"aproxy/internal/pool"
-	"aproxy/pkg/observability"
-	my "aproxy/pkg/protocol/mysql"
-	"aproxy/pkg/replication"
-	"aproxy/pkg/reqtrack"
-	"aproxy/pkg/schema"
-	"aproxy/pkg/session"
-	"aproxy/pkg/sqlrewrite"
+	"MyProxy/internal/config"
+	"MyProxy/internal/pool"
+	"MyProxy/pkg/observability"
+	my "MyProxy/pkg/protocol/mysql"
+	"MyProxy/pkg/replication"
+	"MyProxy/pkg/reqtrack"
+	"MyProxy/pkg/schema"
+	"MyProxy/pkg/session"
+	"MyProxy/pkg/sqlrewrite"
 
 	"github.com/go-mysql-org/go-mysql/server"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -152,7 +152,6 @@ func main() {
 	}
 
 	handler := my.NewHandler(pgPool, sessionMgr, rewriter, metrics, logger, cfg.SQLRewrite.DebugSQL, replServer)
-	handler.SetShowDatabasesConfig(cfg.DatabaseMapping.ToDatabaseExposureConfig(), cfg.DatabaseMapping.ToSchemaMappingConfig())
 	authUser, authPassword := frontendAuthCredentials(cfg)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)

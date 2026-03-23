@@ -7,18 +7,16 @@ import (
 	"sync"
 	"time"
 
-	"aproxy/pkg/schema"
+	"MyProxy/pkg/schema"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
 type Session struct {
-	ID              string
-	User            string
-	Database        string
-	BackendDatabase string
-	CurrentSchema   string
-	Charset         string
+	ID         string
+	User       string
+	Database   string
+	Charset    string
 	Autocommit      bool
 	InTransaction   bool
 	LastInsertID    uint64
@@ -65,8 +63,6 @@ func NewSession(user, database, clientAddr string) *Session {
 		ID:                  uuid.New().String(),
 		User:                user,
 		Database:            database,
-		BackendDatabase:     database,
-		CurrentSchema:       database,
 		Charset:             "utf8mb4",
 		Autocommit:          true,
 		InTransaction:       false,
@@ -118,19 +114,6 @@ func (m *Manager) Count() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.sessions)
-}
-
-func (s *Session) SetBackendDatabase(database string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.BackendDatabase = database
-}
-
-func (s *Session) SetCurrentSchema(schemaName string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.CurrentSchema = schemaName
-	s.Database = schemaName
 }
 
 func (s *Session) SetPGConn(conn *pgx.Conn) {

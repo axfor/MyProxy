@@ -3,7 +3,6 @@
 package sqlrewrite
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/pingcap/tidb/pkg/parser/ast"
@@ -101,6 +100,9 @@ func createFunctionMap() map[string]string {
 		"json_unquote":      "", // ->>
 		"json_array":        "JSON_BUILD_ARRAY",
 		"json_object":       "JSON_BUILD_OBJECT",
+
+		// Insert/Identity functions
+		"last_insert_id":    "lastval",
 	}
 }
 
@@ -131,6 +133,12 @@ func (v *ASTVisitor) Enter(n ast.Node) (node ast.Node, skipChildren bool) {
 
 	case *ast.CreateTableStmt:
 		return v.visitCreateTable(node)
+
+	case *ast.InsertStmt:
+		return v.visitInsert(node)
+
+	case *ast.AggregateFuncExpr:
+		return v.visitAggregateFunc(node)
 	}
 
 	return n, false
@@ -192,9 +200,8 @@ func (v *ASTVisitor) visitColumnDef(node *ast.ColumnDef) (ast.Node, bool) {
 }
 
 // visitSelect handles SELECT statements
+// Note: LOCK IN SHARE MODE is already parsed as SelectLockForShare by TiDB parser
 func (v *ASTVisitor) visitSelect(node *ast.SelectStmt) (ast.Node, bool) {
-	// Handle SELECT-specific PostgreSQL conversions
-	// For example: MySQL's LIMIT offset, count → PostgreSQL's LIMIT count OFFSET offset
 	return node, false
 }
 
@@ -208,25 +215,13 @@ func (v *ASTVisitor) visitLimit(node *ast.Limit) (ast.Node, bool) {
 	return node, false
 }
 
-// transformIF converts IF(condition, true_val, false_val) to CASE WHEN
+// transformIF handles IF(condition, true_val, false_val)
+// Note: Cannot replace FuncCallExpr with CaseExpr at AST level because TiDB's
+// visitor framework expects the return type to match the input type.
+// The conversion to CASE WHEN is done in PostProcess instead.
+// Here we just skip children so they are not double-processed.
 func (v *ASTVisitor) transformIF(node *ast.FuncCallExpr) (ast.Node, bool) {
-	if len(node.Args) != 3 {
-		v.err = fmt.Errorf("IF function requires 3 arguments, got %d", len(node.Args))
-		return node, true
-	}
-
-	// Build CASE WHEN condition THEN true_val ELSE false_val END
-	caseExpr := &ast.CaseExpr{
-		WhenClauses: []*ast.WhenClause{
-			{
-				Expr:   node.Args[0], // condition
-				Result: node.Args[1], // true_val
-			},
-		},
-		ElseClause: node.Args[2], // false_val
-	}
-
-	return caseExpr, false
+	return node, false
 }
 
 // transformDateAddSub converts DATE_ADD/DATE_SUB
@@ -286,33 +281,45 @@ func (v *ASTVisitor) visitMatchAgainst(node *ast.MatchAgainst) (ast.Node, bool) 
 }
 
 // visitCreateTable handles CREATE TABLE statements
-// Removes INDEX and KEY constraints that are not supported inline in PostgreSQL
-// Converts column types at AST level to avoid string matching issues
+// Removes INDEX/KEY constraints, MySQL table options, converts column types at AST level
 func (v *ASTVisitor) visitCreateTable(node *ast.CreateTableStmt) (ast.Node, bool) {
 	// Filter out INDEX and KEY constraints
-	// PostgreSQL doesn't support inline INDEX definitions in CREATE TABLE
-	// They must be created separately using CREATE INDEX
 	filteredConstraints := make([]*ast.Constraint, 0, len(node.Constraints))
-
 	for _, constraint := range node.Constraints {
-		// Keep all constraints except INDEX and KEY
-		// ConstraintIndex (value 3) represents INDEX/KEY definitions
 		if constraint.Tp != ast.ConstraintIndex && constraint.Tp != ast.ConstraintKey {
-			// PostgreSQL doesn't support named UNIQUE constraints in CREATE TABLE
-			// Clear the name for UNIQUE constraints (UNIQUE INDEX/KEY idx_name -> UNIQUE)
 			if constraint.Tp == ast.ConstraintUniq {
 				constraint.Name = ""
 			}
 			filteredConstraints = append(filteredConstraints, constraint)
 		}
-		// Note: We skip INDEX and KEY constraints
-		// PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK etc. are kept
 	}
-
 	node.Constraints = filteredConstraints
 
+	// Remove MySQL-specific table options at AST level
+	// (ENGINE, CHARSET, COLLATE, AUTO_INCREMENT value, ROW_FORMAT, etc.)
+	if len(node.Options) > 0 {
+		filtered := make([]*ast.TableOption, 0)
+		for _, opt := range node.Options {
+			switch opt.Tp {
+			case ast.TableOptionEngine,
+				ast.TableOptionCharset,
+				ast.TableOptionCollate,
+				ast.TableOptionAutoIncrement,
+				ast.TableOptionRowFormat,
+				ast.TableOptionKeyBlockSize,
+				ast.TableOptionCompression:
+				// Skip MySQL-specific options
+			case ast.TableOptionComment:
+				// Keep COMMENT (PostgreSQL supports it via separate command, but we keep it for reference)
+				filtered = append(filtered, opt)
+			default:
+				filtered = append(filtered, opt)
+			}
+		}
+		node.Options = filtered
+	}
+
 	// Convert column types at AST level
-	// This ensures we only modify actual type definitions, not column names
 	for _, col := range node.Cols {
 		v.convertColumnType(col)
 	}
@@ -386,6 +393,11 @@ func (v *ASTVisitor) convertColumnType(col *ast.ColumnDef) {
 	// These use replaceWord() with word boundary checking, so risk is minimal
 	}
 
+	// Remove ZEROFILL flag at AST level (PostgreSQL doesn't support it)
+	if mysql.HasZerofillFlag(tp.GetFlag()) {
+		tp.DelFlag(mysql.ZerofillFlag)
+	}
+
 	// Handle UNSIGNED flag
 	// MySQL UNSIGNED types need larger PostgreSQL types to accommodate the range
 	if mysql.HasUnsignedFlag(tp.GetFlag()) {
@@ -436,4 +448,42 @@ func (v *ASTVisitor) convertColumnType(col *ast.ColumnDef) {
 			// but final conversion happens in convertAutoIncrement()
 		}
 	}
+}
+
+// visitInsert handles INSERT statements
+// Converts ON DUPLICATE KEY UPDATE → ON CONFLICT ... DO UPDATE SET at AST level
+// Note: TiDB RestoreSQL outputs ON DUPLICATE KEY UPDATE (MySQL syntax),
+// so the actual conversion must happen in PostProcess.
+// Here we just validate the AST structure.
+func (v *ASTVisitor) visitInsert(node *ast.InsertStmt) (ast.Node, bool) {
+	// ON DUPLICATE KEY UPDATE is parsed into node.OnDuplicate
+	// TiDB's RestoreSQL will output it in MySQL format.
+	// PostProcess will convert it to ON CONFLICT DO UPDATE SET.
+	// We keep the AST traversal here so child nodes (e.g., function calls
+	// in assignment expressions) are still visited and transformed.
+	return node, false
+}
+
+// visitAggregateFunc handles aggregate function expressions
+// Converts GROUP_CONCAT to STRING_AGG at AST level
+// MySQL: GROUP_CONCAT(col ORDER BY col2 SEPARATOR ',')
+// PostgreSQL: STRING_AGG(col, ',' ORDER BY col2)
+func (v *ASTVisitor) visitAggregateFunc(node *ast.AggregateFuncExpr) (ast.Node, bool) {
+	if strings.ToLower(node.F) != "group_concat" {
+		return node, false
+	}
+
+	// Change function name to STRING_AGG
+	node.F = "STRING_AGG"
+
+	// STRING_AGG requires exactly 2 arguments: (expression, separator)
+	// GROUP_CONCAT has the separator embedded in the SEPARATOR clause,
+	// not as an argument.
+	// TiDB's RestoreSQL for AggregateFuncExpr with F="STRING_AGG" will
+	// output it with the args directly. We need PostProcess to handle
+	// the SEPARATOR extraction because TiDB's restore doesn't understand
+	// STRING_AGG syntax.
+	// However, renaming the function at AST level is still valuable.
+
+	return node, false
 }
