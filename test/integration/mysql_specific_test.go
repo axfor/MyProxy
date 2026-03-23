@@ -354,6 +354,32 @@ func TestLastInsertID(t *testing.T) {
 	assert.Equal(t, 1501, count, "Should have 1501 total rows")
 }
 
+func TestLastInsertIDWithDatabaseMapping(t *testing.T) {
+	db, err := sql.Open("mysql", "root@tcp(localhost:3306)/test")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec("USE test")
+	require.NoError(t, err)
+
+	db.Exec("DROP TABLE IF EXISTS test_last_id_mapping")
+	_, err = db.Exec("CREATE TABLE test_last_id_mapping (id INT AUTO_INCREMENT PRIMARY KEY, val INT)")
+	require.NoError(t, err)
+	defer db.Exec("DROP TABLE IF EXISTS test_last_id_mapping")
+
+	result, err := db.Exec("INSERT INTO test_last_id_mapping (val) VALUES (42)")
+	require.NoError(t, err)
+
+	lastIDFromResult, err := result.LastInsertId()
+	require.NoError(t, err)
+	assert.Greater(t, lastIDFromResult, int64(0))
+
+	var lastIDFromFunc int64
+	err = db.QueryRow("SELECT LAST_INSERT_ID()").Scan(&lastIDFromFunc)
+	require.NoError(t, err)
+	assert.Equal(t, lastIDFromResult, lastIDFromFunc)
+}
+
 // TestYearType tests YEAR type conversion
 // MySQL YEAR type is converted to PostgreSQL SMALLINT via AST rewriting
 func TestYearType(t *testing.T) {

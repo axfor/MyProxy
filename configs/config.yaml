@@ -10,11 +10,17 @@ postgres:
   host: "localhost"
   port: 5432
   database: "test"
-  user: "bast"
-  password: ""
+  user: "dbuser"
+  password: "Aa123456"
   max_pool_size: 200
   connection_mode: "session_affinity" # session_affinity, pooled, or hybrid
   ssl_mode: "disable" # disable, allow, prefer, require
+
+database_mapping:
+  default_schema: "public"
+  fallback_to_public: false
+  rules:
+    test: "test"
 
 auth:
   mode: "pass_through" # pass_through or proxy_auth

@@ -1,4 +1,4 @@
-.PHONY: all build clean test test-unit test-integration test-pg-unsupported bench tpcc run docker-build docker-push help
+.PHONY: all build build-arm clean test test-unit test-integration test-pg-unsupported bench tpcc run docker-build docker-push help
 
 BINARY_NAME=aproxy
 VERSION?=dev
@@ -14,6 +14,7 @@ all: build
 help:
 	@echo "Available targets:"
 	@echo "  build              - Build the binary"
+	@echo "  build-arm          - Build the Linux ARM64 binary"
 	@echo "  clean              - Remove build artifacts"
 	@echo "  test               - Run all tests (unit + integration)"
 	@echo "  test-unit          - Run unit tests"
@@ -32,6 +33,10 @@ build:
 build-linux:
 	@echo "Building $(BINARY_NAME) for Linux with GOEXPERIMENT=$(GOEXPERIMENT)..."
 	GOOS=linux GOARCH=amd64 GOEXPERIMENT=$(GOEXPERIMENT) go build $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-amd64 ./cmd/aproxy
+
+build-arm:
+	@echo "Building $(BINARY_NAME) for Linux ARM64 with GOEXPERIMENT=$(GOEXPERIMENT)..."
+	GOOS=linux GOARCH=arm64 GOEXPERIMENT=$(GOEXPERIMENT) go build $(LDFLAGS) -o bin/$(BINARY_NAME)-linux-arm64 ./cmd/aproxy
 
 clean:
 	@echo "Cleaning..."

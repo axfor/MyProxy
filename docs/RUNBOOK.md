@@ -48,7 +48,18 @@ postgres:
   password: "secure-password"
   max_pool_size: 200
   connection_mode: "session_affinity"
+
+database_mapping:
+  default_schema: "public"
+  fallback_to_public: false
 ```
+
+说明:
+
+- `postgres.database` 是固定的 PostgreSQL physical database，不会随着 MySQL 客户端 `USE db` 切换。
+- 在 `session_affinity` 模式下，MySQL logical database 会映射到 PostgreSQL schema。
+- `database_mapping.fallback_to_public: false` 是默认严格边界，避免未限定对象静默回退到 `public`。
+- `SHOW DATABASES` 返回的是 logical database 列表，而不是 PostgreSQL physical database 列表。
 
 2. **构建和运行**
 
@@ -371,6 +382,8 @@ postgres:
   connection_mode: "session_affinity"
   max_pool_size: 1000
 ```
+
+`session_affinity` 也是 schema mapping / `USE db` 语义的必需模式；`pooled` 与 `hybrid` 不提供同等的 schema 重放保证。
 
 2. **连接池大小**
 

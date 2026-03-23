@@ -61,12 +61,12 @@ type ColumnInfo struct {
 // TableInfo contains schema information for a table
 type TableInfo struct {
 	TableName      string
-	Schema         string        // Schema name (e.g., "public")
-	AutoIncrColumn string        // Empty string if no auto-increment column
-	Columns        []ColumnInfo  // Full column information
-	PrimaryKey     []string      // Primary key column names
-	TableID        uint64        // Unique table ID for binlog
-	LastRefreshed  time.Time     // When this info was last queried
+	Schema         string       // Schema name (e.g., "public")
+	AutoIncrColumn string       // Empty string if no auto-increment column
+	Columns        []ColumnInfo // Full column information
+	PrimaryKey     []string     // Primary key column names
+	TableID        uint64       // Unique table ID for binlog
+	LastRefreshed  time.Time    // When this info was last queried
 	TTL            time.Duration
 }
 
@@ -103,12 +103,15 @@ func GetGlobalCache() *Cache {
 	return GlobalCache
 }
 
+type autoIncrementQueryer interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // GetAutoIncrementColumn returns the AUTO_INCREMENT column name for a table
 // It uses cached data if available and not expired, otherwise queries PostgreSQL
-// The cache key format is "database.table" to support multiple databases
-func (c *Cache) GetAutoIncrementColumn(conn *pgx.Conn, database, tableName string) string {
-	// Build cache key as "database.table"
-	cacheKey := database + "." + tableName
+// The cache key format is "schema.table" to support multiple schemas
+func (c *Cache) GetAutoIncrementColumn(conn *pgx.Conn, schemaName, tableName string) string {
+	cacheKey := buildTableCacheKey(schemaName, tableName)
 
 	// Try to get from cache (no type assertion needed with generics!)
 	if tableInfo, ok := c.tables.Load(cacheKey); ok {
@@ -119,11 +122,12 @@ func (c *Cache) GetAutoIncrementColumn(conn *pgx.Conn, database, tableName strin
 	}
 
 	// Cache miss or expired, query from PostgreSQL
-	columnName := c.queryAutoIncrementColumn(conn, tableName)
+	columnName := c.queryAutoIncrementColumn(conn, schemaName, tableName)
 
 	// Update cache
 	c.tables.Store(cacheKey, &TableInfo{
 		TableName:      tableName,
+		Schema:         schemaName,
 		AutoIncrColumn: columnName,
 		LastRefreshed:  time.Now(),
 		TTL:            c.ttl,
@@ -133,8 +137,16 @@ func (c *Cache) GetAutoIncrementColumn(conn *pgx.Conn, database, tableName strin
 }
 
 // queryAutoIncrementColumn queries PostgreSQL system tables to find auto-increment column
-func (c *Cache) queryAutoIncrementColumn(conn *pgx.Conn, tableName string) string {
+func (c *Cache) queryAutoIncrementColumn(conn *pgx.Conn, schemaName, tableName string) string {
 	if conn == nil {
+		return ""
+	}
+
+	return c.queryAutoIncrementColumnWithQueryer(conn, schemaName, tableName)
+}
+
+func (c *Cache) queryAutoIncrementColumnWithQueryer(queryer autoIncrementQueryer, schemaName, tableName string) string {
+	if queryer == nil {
 		return ""
 	}
 
@@ -146,8 +158,8 @@ func (c *Cache) queryAutoIncrementColumn(conn *pgx.Conn, tableName string) strin
 	query := `
 		SELECT column_name
 		FROM information_schema.columns
-		WHERE table_name = $1
-		  AND table_schema = current_schema()
+		WHERE table_schema = $1
+		  AND table_name = $2
 		  AND (
 		      column_default LIKE 'nextval(%'
 		      OR is_identity = 'YES'
@@ -157,7 +169,7 @@ func (c *Cache) queryAutoIncrementColumn(conn *pgx.Conn, tableName string) strin
 	`
 
 	var columnName string
-	err := conn.QueryRow(ctx, query, strings.ToLower(tableName)).Scan(&columnName)
+	err := queryer.QueryRow(ctx, query, schemaName, strings.ToLower(tableName)).Scan(&columnName)
 	if err != nil {
 		// No auto-increment column found or query failed
 		return ""
@@ -168,9 +180,9 @@ func (c *Cache) queryAutoIncrementColumn(conn *pgx.Conn, tableName string) strin
 
 // InvalidateTable removes a table from the cache
 // This should be called when a DDL statement modifies the table
-// The key format is "database.table"
-func (c *Cache) InvalidateTable(database, tableName string) {
-	cacheKey := database + "." + tableName
+// The key format is "schema.table"
+func (c *Cache) InvalidateTable(schemaName, tableName string) {
+	cacheKey := buildTableCacheKey(schemaName, tableName)
 	c.tables.Delete(cacheKey)
 }
 
@@ -183,11 +195,11 @@ func (c *Cache) InvalidateAll() {
 }
 
 // RefreshTable forces a refresh of table schema information
-func (c *Cache) RefreshTable(conn *pgx.Conn, database, tableName string) string {
+func (c *Cache) RefreshTable(conn *pgx.Conn, schemaName, tableName string) string {
 	// Force refresh by invalidating first
-	c.InvalidateTable(database, tableName)
+	c.InvalidateTable(schemaName, tableName)
 	// Then query and cache
-	return c.GetAutoIncrementColumn(conn, database, tableName)
+	return c.GetAutoIncrementColumn(conn, schemaName, tableName)
 }
 
 // GetCacheStats returns statistics about the cache
@@ -456,4 +468,8 @@ func pgTypeToMySQL(pgType string, maxLength int) (uint8, uint16) {
 	default:
 		return MYSQL_TYPE_VARCHAR, 255
 	}
+}
+
+func buildTableCacheKey(schemaName, tableName string) string {
+	return schemaName + "." + tableName
 }

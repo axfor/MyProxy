@@ -20,6 +20,7 @@ import (
 	"MyProxy/pkg/schema"
 	"MyProxy/pkg/session"
 	"MyProxy/pkg/sqlrewrite"
+
 	"github.com/go-mysql-org/go-mysql/server"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
@@ -31,6 +32,10 @@ var (
 	commit     = "none"
 	date       = "unknown"
 )
+
+func frontendAuthCredentials(cfg *config.Config) (string, string) {
+	return cfg.Postgres.User, cfg.Postgres.Password
+}
 
 func main() {
 	flag.Parse()
@@ -147,6 +152,8 @@ func main() {
 	}
 
 	handler := my.NewHandler(pgPool, sessionMgr, rewriter, metrics, logger, cfg.SQLRewrite.DebugSQL, replServer)
+	handler.SetShowDatabasesConfig(cfg.DatabaseMapping.ToDatabaseExposureConfig(), cfg.DatabaseMapping.ToSchemaMappingConfig())
+	authUser, authPassword := frontendAuthCredentials(cfg)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 
@@ -201,7 +208,7 @@ func main() {
 					return
 				}
 
-				mysqlConn, err := server.NewConn(c, "root", "", connHandler)
+				mysqlConn, err := server.NewConn(c, authUser, authPassword, connHandler)
 				if err != nil {
 					logger.Error("Failed to create MySQL connection", zap.Error(err))
 					return

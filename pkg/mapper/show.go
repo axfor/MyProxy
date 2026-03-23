@@ -5,13 +5,53 @@ import (
 	"fmt"
 	"strings"
 
+	schemamapping "MyProxy/pkg/schema"
 	"github.com/jackc/pgx/v5"
 )
 
-type ShowEmulator struct{}
+type ShowEmulator struct {
+	exposureConfig      DatabaseExposureConfig
+	mappingConfig       schemamapping.MappingConfig
+	usageCheckerFactory func(conn *pgx.Conn) SchemaUsageChecker
+}
 
 func NewShowEmulator() *ShowEmulator {
-	return &ShowEmulator{}
+	return &ShowEmulator{
+		exposureConfig: DatabaseExposureConfig{
+			ExposeMode:       ExposeModeExplicit,
+			ExposedDatabases: []string{},
+			Rules:            map[string]string{},
+		},
+		mappingConfig: schemamapping.MappingConfig{
+			DefaultSchema:    "public",
+			FallbackToPublic: false,
+			Rules:            map[string]string{},
+		},
+		usageCheckerFactory: func(conn *pgx.Conn) SchemaUsageChecker {
+			return pgSchemaUsageChecker{conn: conn}
+		},
+	}
+}
+
+func (se *ShowEmulator) ConfigureShowDatabases(exposureConfig DatabaseExposureConfig, mappingConfig schemamapping.MappingConfig) {
+	if exposureConfig.Rules == nil {
+		exposureConfig.Rules = map[string]string{}
+	}
+	if exposureConfig.ExposedDatabases == nil {
+		exposureConfig.ExposedDatabases = []string{}
+	}
+	if exposureConfig.ExposeMode == "" {
+		exposureConfig.ExposeMode = ExposeModeExplicit
+	}
+	if mappingConfig.Rules == nil {
+		mappingConfig.Rules = map[string]string{}
+	}
+	if mappingConfig.DefaultSchema == "" {
+		mappingConfig.DefaultSchema = "public"
+	}
+
+	se.exposureConfig = exposureConfig
+	se.mappingConfig = mappingConfig
 }
 
 func (se *ShowEmulator) HandleShowCommand(ctx context.Context, conn *pgx.Conn, sql string) (pgx.Rows, error) {
@@ -86,13 +126,19 @@ func (se *ShowEmulator) HandleShowCommand(ctx context.Context, conn *pgx.Conn, s
 }
 
 func (se *ShowEmulator) showDatabases(ctx context.Context, conn *pgx.Conn) (pgx.Rows, error) {
-	query := `
-		SELECT schema_name AS "Database"
-		FROM information_schema.schemata
-		WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-		ORDER BY schema_name
-	`
-	return conn.Query(ctx, query)
+	checkerFactory := se.usageCheckerFactory
+	if checkerFactory == nil {
+		checkerFactory = func(conn *pgx.Conn) SchemaUsageChecker {
+			return pgSchemaUsageChecker{conn: conn}
+		}
+	}
+
+	databases, err := ResolveAccessibleDatabases(ctx, se.exposureConfig, se.mappingConfig, checkerFactory(conn))
+	if err != nil {
+		return nil, err
+	}
+
+	return conn.Query(ctx, BuildShowDatabasesResultSQL(databases))
 }
 
 func (se *ShowEmulator) showTables(ctx context.Context, conn *pgx.Conn, sql string) (pgx.Rows, error) {
@@ -437,12 +483,30 @@ func (se *ShowEmulator) extractTableName(sql string) string {
 // HandleSetCommand is a simple string-based fallback for SET commands
 // when AST parsing fails. The primary SET handling is done via AST in the handler.
 func (se *ShowEmulator) HandleSetCommand(ctx context.Context, sql string, sessionVars map[string]interface{}) error {
-	upperSQL := strings.ToUpper(strings.TrimSpace(sql))
+	normalizedSQL := strings.TrimSpace(sql)
+	upperSQL := strings.ToUpper(normalizedSQL)
+
 	if !strings.HasPrefix(upperSQL, "SET ") {
 		return fmt.Errorf("not a SET command: %s", sql)
 	}
 
-	assignment := sql[4:] // skip "SET "
+	assignment := strings.TrimSpace(normalizedSQL[len("SET "):])
+
+	// Handle SET NAMES charset [COLLATE collation]
+	fields := strings.Fields(assignment)
+	if len(fields) >= 2 && strings.EqualFold(fields[0], "NAMES") {
+		charset := strings.Trim(fields[1], "'\"")
+		sessionVars["names"] = charset
+		sessionVars["character_set_client"] = charset
+		sessionVars["character_set_connection"] = charset
+		sessionVars["character_set_results"] = charset
+
+		if len(fields) >= 4 && strings.EqualFold(fields[2], "COLLATE") {
+			sessionVars["collation_connection"] = strings.Trim(fields[3], "'\"")
+		}
+
+		return nil
+	}
 
 	// Strip scope prefixes
 	upperAssign := strings.ToUpper(assignment)

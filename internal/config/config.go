@@ -5,18 +5,21 @@ import (
 	"os"
 	"time"
 
+	"MyProxy/pkg/mapper"
+	schemamapping "MyProxy/pkg/schema"
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Server       ServerConfig       `yaml:"server"`
-	Postgres     PostgresConfig     `yaml:"postgres"`
-	Auth         AuthConfig         `yaml:"auth"`
-	Security     SecurityConfig     `yaml:"security"`
-	SQLRewrite   SQLRewriteConfig   `yaml:"sql_rewrite"`
-	Observability ObservabilityConfig `yaml:"observability"`
-	SchemaCache  SchemaCacheConfig  `yaml:"schema_cache"`
-	Binlog       BinlogConfig       `yaml:"binlog"`
+	Server          ServerConfig          `yaml:"server"`
+	Postgres        PostgresConfig        `yaml:"postgres"`
+	DatabaseMapping DatabaseMappingConfig `yaml:"database_mapping"`
+	Auth            AuthConfig            `yaml:"auth"`
+	Security        SecurityConfig        `yaml:"security"`
+	SQLRewrite      SQLRewriteConfig      `yaml:"sql_rewrite"`
+	Observability   ObservabilityConfig   `yaml:"observability"`
+	SchemaCache     SchemaCacheConfig     `yaml:"schema_cache"`
+	Binlog          BinlogConfig          `yaml:"binlog"`
 }
 
 type ServerConfig struct {
@@ -39,17 +42,53 @@ type PostgresConfig struct {
 	SSLMode        string `yaml:"ssl_mode"`
 }
 
+type DatabaseMappingConfig struct {
+	DefaultSchema    string            `yaml:"default_schema"`
+	FallbackToPublic bool              `yaml:"fallback_to_public"`
+	ExposeMode       string            `yaml:"expose_mode"`
+	ExposedDatabases []string          `yaml:"exposed_databases"`
+	Rules            map[string]string `yaml:"rules"`
+}
+
+func (c DatabaseMappingConfig) ToSchemaMappingConfig() schemamapping.MappingConfig {
+	rules := make(map[string]string, len(c.Rules))
+	for mysqlDB, schemaName := range c.Rules {
+		rules[mysqlDB] = schemaName
+	}
+
+	return schemamapping.MappingConfig{
+		DefaultSchema:    c.DefaultSchema,
+		FallbackToPublic: c.FallbackToPublic,
+		Rules:            rules,
+	}
+}
+
+func (c DatabaseMappingConfig) ToDatabaseExposureConfig() mapper.DatabaseExposureConfig {
+	rules := make(map[string]string, len(c.Rules))
+	for mysqlDB, schemaName := range c.Rules {
+		rules[mysqlDB] = schemaName
+	}
+
+	exposed := append([]string(nil), c.ExposedDatabases...)
+
+	return mapper.DatabaseExposureConfig{
+		ExposeMode:       c.ExposeMode,
+		ExposedDatabases: exposed,
+		Rules:            rules,
+	}
+}
+
 type AuthConfig struct {
 	Mode         string   `yaml:"mode"`
 	AllowedUsers []string `yaml:"allowed_users"`
 }
 
 type SecurityConfig struct {
-	RateLimitPerSecond       int      `yaml:"rate_limit_per_second"`
-	MaxConnectionsPerIP      int      `yaml:"max_connections_per_ip"`
-	EnableTLS                bool     `yaml:"enable_tls"`
-	TLSCert                  string   `yaml:"tls_cert"`
-	TLSKey                   string   `yaml:"tls_key"`
+	RateLimitPerSecond         int      `yaml:"rate_limit_per_second"`
+	MaxConnectionsPerIP        int      `yaml:"max_connections_per_ip"`
+	EnableTLS                  bool     `yaml:"enable_tls"`
+	TLSCert                    string   `yaml:"tls_cert"`
+	TLSKey                     string   `yaml:"tls_key"`
 	DangerousCommandsBlacklist []string `yaml:"dangerous_commands_blacklist"`
 }
 
@@ -60,20 +99,20 @@ type SQLRewriteConfig struct {
 }
 
 type ObservabilityConfig struct {
-	MetricsPort       int    `yaml:"metrics_port"`
-	LogLevel          string `yaml:"log_level"`
-	LogFormat         string `yaml:"log_format"`
-	EnableQueryLog    bool   `yaml:"enable_query_log"`
-	RedactParameters  bool   `yaml:"redact_parameters"`
-	EnableTracing     bool   `yaml:"enable_tracing"`
-	TracingEndpoint   string `yaml:"tracing_endpoint"`
+	MetricsPort      int    `yaml:"metrics_port"`
+	LogLevel         string `yaml:"log_level"`
+	LogFormat        string `yaml:"log_format"`
+	EnableQueryLog   bool   `yaml:"enable_query_log"`
+	RedactParameters bool   `yaml:"redact_parameters"`
+	EnableTracing    bool   `yaml:"enable_tracing"`
+	TracingEndpoint  string `yaml:"tracing_endpoint"`
 }
 
 type SchemaCacheConfig struct {
-	Enabled          bool          `yaml:"enabled"`
-	TTL              time.Duration `yaml:"ttl"`
-	MaxEntries       int           `yaml:"max_entries"`
-	InvalidateOnDDL  bool          `yaml:"invalidate_on_ddl"`
+	Enabled         bool          `yaml:"enabled"`
+	TTL             time.Duration `yaml:"ttl"`
+	MaxEntries      int           `yaml:"max_entries"`
+	InvalidateOnDDL bool          `yaml:"invalidate_on_ddl"`
 }
 
 type BinlogConfig struct {
@@ -81,8 +120,8 @@ type BinlogConfig struct {
 	Dir           string        `yaml:"dir"`
 	MaxFileSize   int64         `yaml:"max_file_size"`
 	MaxFiles      int           `yaml:"max_files"`
-	SyncMode      string        `yaml:"sync_mode"`      // async, sync, fsync
-	Format        string        `yaml:"format"`         // json, binary
+	SyncMode      string        `yaml:"sync_mode"` // async, sync, fsync
+	Format        string        `yaml:"format"`    // json, binary
 	FlushInterval time.Duration `yaml:"flush_interval"`
 	BufferSize    int           `yaml:"buffer_size"`
 	LogDDL        bool          `yaml:"log_ddl"`
@@ -109,6 +148,13 @@ func DefaultConfig() *Config {
 			MaxPoolSize:    100,
 			ConnectionMode: "session_affinity",
 			SSLMode:        "prefer",
+		},
+		DatabaseMapping: DatabaseMappingConfig{
+			DefaultSchema:    "public",
+			FallbackToPublic: false,
+			ExposeMode:       "explicit",
+			ExposedDatabases: []string{},
+			Rules:            map[string]string{},
 		},
 		Auth: AuthConfig{
 			Mode:         "pass_through",
@@ -176,6 +222,18 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	if cfg.DatabaseMapping.Rules == nil {
+		cfg.DatabaseMapping.Rules = map[string]string{}
+	}
+
+	if cfg.DatabaseMapping.ExposeMode == "" {
+		cfg.DatabaseMapping.ExposeMode = "explicit"
+	}
+
+	if cfg.DatabaseMapping.ExposedDatabases == nil {
+		cfg.DatabaseMapping.ExposedDatabases = []string{}
+	}
+
 	return cfg, nil
 }
 
@@ -202,6 +260,16 @@ func (c *Config) Validate() error {
 
 	if c.Postgres.MaxPoolSize < 1 {
 		return fmt.Errorf("postgres max_pool_size must be at least 1")
+	}
+
+	if c.DatabaseMapping.DefaultSchema == "" {
+		return fmt.Errorf("database_mapping default_schema is required")
+	}
+
+	if c.DatabaseMapping.ExposeMode != "" &&
+		c.DatabaseMapping.ExposeMode != mapper.ExposeModeExplicit &&
+		c.DatabaseMapping.ExposeMode != mapper.ExposeModeAllAccessibleSchemas {
+		return fmt.Errorf("invalid database_mapping expose_mode: %s", c.DatabaseMapping.ExposeMode)
 	}
 
 	if c.Auth.Mode != "pass_through" && c.Auth.Mode != "proxy_auth" {

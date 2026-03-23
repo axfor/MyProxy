@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 	"time"
 
@@ -25,18 +26,21 @@ import (
 )
 
 type Handler struct {
-	pgPool       *pool.Pool
-	sessionMgr   *session.Manager
-	rewriter     *sqlrewrite.Rewriter
-	stmtParser   *sqlrewrite.StmtParser
-	typeMapper   *mapper.TypeMapper
-	errorMapper  *mapper.ErrorMapper
-	showEmulator *mapper.ShowEmulator
-	replAdmin    *admin.ReplicationAdmin
-	metrics      *observability.Metrics
-	logger       *observability.Logger
-	debugSQL     bool
-	replServer   *replication.Server // MySQL binlog replication server
+	pgPool           *pool.Pool
+	sessionMgr       *session.Manager
+	rewriter         *sqlrewrite.Rewriter
+	stmtParser       *sqlrewrite.StmtParser
+	typeMapper       *mapper.TypeMapper
+	errorMapper      *mapper.ErrorMapper
+	showEmulator     *mapper.ShowEmulator
+	replAdmin        *admin.ReplicationAdmin
+	metrics          *observability.Metrics
+	logger           *observability.Logger
+	debugSQL         bool
+	connectionMode   pool.ConnectionMode
+	schemaResolver   *schema.Resolver
+	fallbackToPublic bool
+	replServer       *replication.Server // MySQL binlog replication server
 }
 
 func NewHandler(
@@ -49,24 +53,53 @@ func NewHandler(
 	replServer *replication.Server,
 ) *Handler {
 	return &Handler{
-		pgPool:       pgPool,
-		sessionMgr:   sessionMgr,
-		rewriter:     rewriter,
-		stmtParser:   sqlrewrite.NewStmtParser(),
-		typeMapper:   mapper.NewTypeMapper(),
-		errorMapper:  mapper.NewErrorMapper(),
-		showEmulator: mapper.NewShowEmulator(),
-		replAdmin:    admin.NewReplicationAdmin(),
-		metrics:      metrics,
-		logger:       logger,
-		debugSQL:     debugSQL,
-		replServer:   replServer,
+		pgPool:           pgPool,
+		sessionMgr:       sessionMgr,
+		rewriter:         rewriter,
+		stmtParser:       sqlrewrite.NewStmtParser(),
+		typeMapper:       mapper.NewTypeMapper(),
+		errorMapper:      mapper.NewErrorMapper(),
+		showEmulator:     mapper.NewShowEmulator(),
+		replAdmin:        admin.NewReplicationAdmin(),
+		metrics:          metrics,
+		logger:           logger,
+		debugSQL:         debugSQL,
+		connectionMode:   inferConnectionMode(pgPool),
+		schemaResolver:   schema.NewResolver(schema.MappingConfig{DefaultSchema: "public"}),
+		fallbackToPublic: false,
+		replServer:       replServer,
 	}
+}
+
+func inferConnectionMode(pgPool *pool.Pool) pool.ConnectionMode {
+	if pgPool == nil {
+		return pool.ModeSessionAffinity
+	}
+
+	value := reflect.ValueOf(pgPool)
+	if value.Kind() != reflect.Pointer || value.IsNil() {
+		return pool.ModeSessionAffinity
+	}
+
+	modeField := value.Elem().FieldByName("mode")
+	if !modeField.IsValid() || modeField.Kind() != reflect.String {
+		return pool.ModeSessionAffinity
+	}
+
+	return pool.ConnectionMode(modeField.String())
 }
 
 // SetReplicationServer sets the replication server for handling COM_BINLOG_DUMP
 func (h *Handler) SetReplicationServer(server *replication.Server) {
 	h.replServer = server
+}
+
+func (h *Handler) SetShowDatabasesConfig(exposureConfig mapper.DatabaseExposureConfig, mappingConfig schema.MappingConfig) {
+	if h.showEmulator == nil {
+		h.showEmulator = mapper.NewShowEmulator()
+	}
+
+	h.showEmulator.ConfigureShowDatabases(exposureConfig, mappingConfig)
 }
 
 func (h *Handler) NewConnection(conn net.Conn) (server.Handler, error) {
@@ -92,15 +125,51 @@ type ConnectionHandler struct {
 }
 
 func (ch *ConnectionHandler) UseDB(dbName string) error {
-	ch.session.Database = dbName
+	if ch.handler.connectionMode != pool.ModeSessionAffinity {
+		return mysql.NewError(mysql.ER_UNKNOWN_ERROR, fmt.Sprintf("current connection mode %s does not support USE db / COM_INIT_DB semantics", ch.handler.connectionMode))
+	}
+
+	if ch.session.InTransaction {
+		return mysql.NewError(mysql.ER_UNKNOWN_ERROR, "cannot change database while transaction is active")
+	}
 
 	if ch.pgConn != nil {
-		ctx := context.Background()
-		_, err := ch.pgConn.Exec(ctx, fmt.Sprintf("SET search_path TO %s", dbName))
+		return ch.switchSchema(context.Background(), ch.pgConn, dbName)
+	}
+
+	ch.session.Database = dbName
+	return nil
+}
+
+func (ch *ConnectionHandler) switchSchema(ctx context.Context, executor schema.SearchPathExecutor, dbName string) error {
+	resolver := ch.handler.schemaResolver
+	if resolver == nil {
+		resolver = schema.NewResolver(schema.MappingConfig{DefaultSchema: "public"})
+	}
+
+	schemaName, err := resolver.ResolveSchema(dbName)
+	if err != nil {
 		return err
 	}
 
+	if err := schema.ApplySchema(ctx, executor, schemaName, ch.handler.fallbackToPublic); err != nil {
+		return err
+	}
+
+	ch.session.SetCurrentSchema(schemaName)
 	return nil
+}
+
+func (ch *ConnectionHandler) applyInitialSchema(ctx context.Context, executor schema.SearchPathExecutor) error {
+	if ch.session.Database == "" || ch.session.CurrentSchema == ch.session.Database {
+		return nil
+	}
+
+	if ch.handler.connectionMode != pool.ModeSessionAffinity {
+		return mysql.NewError(mysql.ER_UNKNOWN_ERROR, fmt.Sprintf("current connection mode %s does not support USE db / COM_INIT_DB semantics", ch.handler.connectionMode))
+	}
+
+	return ch.switchSchema(ctx, executor, ch.session.Database)
 }
 
 func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
@@ -122,6 +191,9 @@ func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
 		}
 		ch.pgConn = conn
 		ch.session.SetPGConn(conn)
+		if err := ch.applyInitialSchema(ctx, conn); err != nil {
+			return nil, err
+		}
 	}
 
 	if ch.handler.rewriter.IsShowStatement(query) {
@@ -347,7 +419,7 @@ func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
 				tableName := extractCreateTableName(query)
 
 				// Invalidate cache for the new table (it will be refreshed on first INSERT)
-				schema.GetGlobalCache().InvalidateTable(ch.session.Database, tableName)
+				schema.GetGlobalCache().InvalidateTable(ch.session.CurrentSchema, tableName)
 
 				// Also mark in session for backward compatibility
 				columnName := extractAutoIncrementColumn(query)
@@ -358,13 +430,13 @@ func (ch *ConnectionHandler) HandleQuery(query string) (*mysql.Result, error) {
 				// ALTER TABLE may change AUTO_INCREMENT columns
 				tableName := extractAlterTableName(query)
 				if tableName != "" {
-					schema.GetGlobalCache().InvalidateTable(ch.session.Database, tableName)
+					schema.GetGlobalCache().InvalidateTable(ch.session.CurrentSchema, tableName)
 				}
 			} else if strings.HasPrefix(upperQuery, "DROP TABLE") {
 				// DROP TABLE removes the table
 				tableName := extractDropTableName(query)
 				if tableName != "" {
-					schema.GetGlobalCache().InvalidateTable(ch.session.Database, tableName)
+					schema.GetGlobalCache().InvalidateTable(ch.session.CurrentSchema, tableName)
 				}
 			}
 		}
@@ -902,7 +974,6 @@ func (ch *ConnectionHandler) buildMySQLResult(rows pgx.Rows, binary bool) (*mysq
 		return nil, err
 	}
 
-
 	// Fix: BuildSimpleResultset doesn't populate FieldNames map or set correct types for DECIMAL
 	// Manually fill these in using PostgreSQL FieldDescriptions
 
@@ -927,7 +998,7 @@ func (ch *ConnectionHandler) buildMySQLResult(rows pgx.Rows, binary bool) (*mysq
 			// BuildSimpleTextResultset inferred this as MYSQL_TYPE_VAR_STRING (from string value)
 			// But MySQL clients expect MYSQL_TYPE_NEWDECIMAL for decimal columns
 			resultset.Fields[i].Type = mysql.MYSQL_TYPE_NEWDECIMAL
-			resultset.Fields[i].Charset = 63  // binary charset for numeric types
+			resultset.Fields[i].Charset = 63 // binary charset for numeric types
 			resultset.Fields[i].Flag = mysql.BINARY_FLAG | mysql.NOT_NULL_FLAG
 
 			// Parse TypeModifier to extract precision and scale
@@ -979,7 +1050,6 @@ func (ch *ConnectionHandler) buildMySQLResult(rows pgx.Rows, binary bool) (*mysq
 			resultset.Fields[i].ColumnLength = 8 // "HH:MM:SS"
 		}
 	}
-
 
 	result := &mysql.Result{
 		Status:    0,

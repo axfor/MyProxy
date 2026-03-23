@@ -16,6 +16,11 @@ postgres:
   connection_mode: "session_affinity" # session_affinity, pooled, or hybrid
   ssl_mode: "disable" # disable, allow, prefer, require
 
+database_mapping:
+  default_schema: "public"
+  fallback_to_public: false
+  rules: {}
+
 auth:
   mode: "pass_through" # pass_through or proxy_auth
   allowed_users: []

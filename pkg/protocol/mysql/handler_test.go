@@ -1,8 +1,197 @@
 package mysql
 
 import (
+	"context"
+	"errors"
 	"testing"
+
+	"MyProxy/internal/pool"
+	"MyProxy/pkg/schema"
+	"MyProxy/pkg/session"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+type fakeSchemaExecutor struct {
+	err     error
+	calls   int
+	lastSQL string
+}
+
+func (f *fakeSchemaExecutor) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+	f.calls++
+	f.lastSQL = sql
+	return pgconn.CommandTag{}, f.err
+}
+
+func TestUseDB(t *testing.T) {
+	tests := []struct {
+		name            string
+		mode            pool.ConnectionMode
+		inTransaction   bool
+		wantErr         string
+		expectedDBAfter string
+	}{
+		{
+			name:            "session_affinity allows UseDB",
+			mode:            pool.ModeSessionAffinity,
+			expectedDBAfter: "tenant_db",
+		},
+		{
+			name:            "pooled rejects UseDB",
+			mode:            pool.ModePooled,
+			wantErr:         "does not support USE db / COM_INIT_DB semantics",
+			expectedDBAfter: "initial_db",
+		},
+		{
+			name:            "hybrid rejects UseDB",
+			mode:            pool.ModeHybrid,
+			wantErr:         "does not support USE db / COM_INIT_DB semantics",
+			expectedDBAfter: "initial_db",
+		},
+		{
+			name:            "transaction rejects UseDB",
+			mode:            pool.ModeSessionAffinity,
+			inTransaction:   true,
+			wantErr:         "cannot change database while transaction is active",
+			expectedDBAfter: "initial_db",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess := session.NewSession("alice", "initial_db", "127.0.0.1")
+			sess.InTransaction = tt.inTransaction
+
+			handler := &ConnectionHandler{
+				handler: &Handler{
+					connectionMode: tt.mode,
+				},
+				session: sess,
+			}
+
+			err := handler.UseDB("tenant_db")
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+
+			assert.Equal(t, tt.expectedDBAfter, sess.Database)
+		})
+	}
+}
+
+func TestSwitchSchemaUpdatesStateAfterApplyState(t *testing.T) {
+	sess := session.NewSession("alice", "initial_db", "127.0.0.1")
+	executor := &fakeSchemaExecutor{}
+	ch := &ConnectionHandler{
+		handler: &Handler{
+			schemaResolver: schema.NewResolver(schema.MappingConfig{DefaultSchema: "public"}),
+		},
+		session: sess,
+	}
+
+	err := ch.switchSchema(context.Background(), executor, "tenant_db")
+	require.NoError(t, err)
+	assert.Equal(t, 1, executor.calls)
+	assert.Equal(t, "tenant_db", sess.CurrentSchema)
+	assert.Equal(t, "tenant_db", sess.Database)
+}
+
+func TestSwitchSchemaPreservesCurrentSchemaStateOnApplyFailure(t *testing.T) {
+	sess := session.NewSession("alice", "initial_db", "127.0.0.1")
+	executor := &fakeSchemaExecutor{err: errors.New("apply failed")}
+	ch := &ConnectionHandler{
+		handler: &Handler{
+			schemaResolver: schema.NewResolver(schema.MappingConfig{DefaultSchema: "public"}),
+		},
+		session: sess,
+	}
+
+	err := ch.switchSchema(context.Background(), executor, "tenant_db")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apply failed")
+	assert.Equal(t, 1, executor.calls)
+	assert.Equal(t, "initial_db", sess.CurrentSchema)
+}
+
+func TestSwitchSchemaPreservesCompatibilityDatabaseStateOnApplyFailure(t *testing.T) {
+	sess := session.NewSession("alice", "initial_db", "127.0.0.1")
+	executor := &fakeSchemaExecutor{err: errors.New("apply failed")}
+	ch := &ConnectionHandler{
+		handler: &Handler{
+			schemaResolver: schema.NewResolver(schema.MappingConfig{DefaultSchema: "public"}),
+		},
+		session: sess,
+	}
+
+	err := ch.switchSchema(context.Background(), executor, "tenant_db")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apply failed")
+	assert.Equal(t, "initial_db", sess.Database)
+}
+
+func TestInitialSchemaAppliedOnFirstConnection(t *testing.T) {
+	sess := session.NewSession("alice", "", "127.0.0.1")
+	sess.Database = "tenant_db"
+	executor := &fakeSchemaExecutor{}
+	ch := &ConnectionHandler{
+		handler: &Handler{
+			connectionMode: pool.ModeSessionAffinity,
+			schemaResolver: schema.NewResolver(schema.MappingConfig{DefaultSchema: "public"}),
+		},
+		session: sess,
+	}
+
+	err := ch.applyInitialSchema(context.Background(), executor)
+	require.NoError(t, err)
+	assert.Equal(t, 1, executor.calls)
+	assert.Equal(t, "SET search_path TO tenant_db", executor.lastSQL)
+	assert.Equal(t, "tenant_db", sess.CurrentSchema)
+	assert.Equal(t, "tenant_db", sess.Database)
+}
+
+func TestInitialSchemaRejectsNonSessionAffinityMode(t *testing.T) {
+	sess := session.NewSession("alice", "", "127.0.0.1")
+	sess.Database = "tenant_db"
+	executor := &fakeSchemaExecutor{}
+	ch := &ConnectionHandler{
+		handler: &Handler{
+			connectionMode: pool.ModePooled,
+			schemaResolver: schema.NewResolver(schema.MappingConfig{DefaultSchema: "public"}),
+		},
+		session: sess,
+	}
+
+	err := ch.applyInitialSchema(context.Background(), executor)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not support USE db / COM_INIT_DB semantics")
+	assert.Equal(t, 0, executor.calls)
+	assert.Equal(t, "", sess.CurrentSchema)
+}
+
+func TestInitialSchemaFailureDoesNotSetCurrentSchema(t *testing.T) {
+	sess := session.NewSession("alice", "", "127.0.0.1")
+	sess.Database = "tenant_db"
+	executor := &fakeSchemaExecutor{err: errors.New("apply failed")}
+	ch := &ConnectionHandler{
+		handler: &Handler{
+			connectionMode: pool.ModeSessionAffinity,
+			schemaResolver: schema.NewResolver(schema.MappingConfig{DefaultSchema: "public"}),
+		},
+		session: sess,
+	}
+
+	err := ch.applyInitialSchema(context.Background(), executor)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apply failed")
+	assert.Equal(t, 1, executor.calls)
+	assert.Equal(t, "", sess.CurrentSchema)
+	assert.Equal(t, "tenant_db", sess.Database)
+}
 
 func TestIsKillStatement(t *testing.T) {
 	tests := []struct {
