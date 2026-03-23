@@ -19,6 +19,9 @@
 | 服务器状态查询 | 5 | 5 ✅ | pkg/mapper/variables.go + show_admin.go + handler.go |
 | Binlog 管理 | 3 | 3 ✅ | pkg/mapper/variables.go + show_admin.go + replication.go |
 | 其他特性 | 4 | 4 ✅ | handler.go (TABLESPACE/FLUSH/foreign_key_checks/KILL) |
+| 数据库管理 | 3 | 3 ✅ | handler.go (CREATE/DROP DATABASE→SCHEMA, USE db→search_path) |
+| 会话命令 | 2 | 2 ✅ | show.go (SET NAMES, ensurePGConn search_path) |
+| 变量查询统一 | 2 | 2 ✅ | show.go (SHOW [GLOBAL] VARIABLES LIKE → 映射表优先查找) |
 
 ---
 
@@ -303,40 +306,46 @@ var mysqlToPostgresVars = map[string]VarMapping{
 
 ---
 
-## 四、实现优先级与里程碑
+## 四、实现状态（全部已完成 ✅）
 
-| 阶段 | 内容 | 新增文件 | 修改文件 | 预估复杂度 |
-|------|------|---------|---------|-----------|
-| **Phase 1** | 复制控制 + 状态查询 + GTID | 4 | 2 | ★★★★★ |
-| **Phase 2** | 半同步 + 读写控制 | 1 | 2 | ★★★☆☆ |
-| **Phase 3** | 用户权限管理 | 2 | 1 | ★★★★☆ |
-| **Phase 4** | Binlog/进程/配置管理 | 0 | 2 | ★★★☆☆ |
-| **Phase 5** | 备份恢复 + 杂项 | 1 | 1 | ★★☆☆☆ |
-
-### 建议实现顺序
-
-1. **Phase 2（半同步 + 读写控制）** → 改动最小，效果明显，先建立变量映射框架
-2. **Phase 1（复制控制）** → 核心功能，依赖变量映射框架
-3. **Phase 4（服务器管理）** → SHOW PROCESSLIST / KILL 等常用运维命令
-4. **Phase 3（用户权限）** → ACL 管理
-5. **Phase 5（备份恢复）** → 独立子系统
+| 阶段 | 内容 | 状态 | 实现文件 |
+|------|------|------|---------|
+| **Phase 1** | 复制控制 + 状态查询 + GTID | ✅ 已完成 | pkg/admin/replication.go, pkg/mapper/show_admin.go, pkg/mapper/variables.go |
+| **Phase 2** | 半同步 + 读写控制 | ✅ 已完成 | pkg/mapper/variables.go (变量映射表) |
+| **Phase 3** | 用户权限管理 (AST) | ✅ 已完成 | pkg/sqlrewrite/rewrite_acl.go (TiDB AST) |
+| **Phase 4** | Binlog/进程/配置管理 | ✅ 已完成 | pkg/mapper/show_admin.go, handler.go |
+| **Phase 5** | 备份恢复 + 杂项 | ✅ 已完成 | pkg/admin/backup.go, handler.go |
+| **追加** | 数据库管理 (CREATE/DROP DB) | ✅ 已完成 | handler.go (→ CREATE/DROP SCHEMA) |
+| **追加** | SET NAMES + search_path 统一 | ✅ 已完成 | show.go, handler.go (ensurePGConn) |
+| **追加** | SHOW VARIABLES LIKE 映射表优先 | ✅ 已完成 | show.go (GetMySQLVarValue 优先查找) |
 
 ---
 
-## 五、测试策略
+## 五、测试状态（全部通过 ✅）
 
-每个 Phase 对应独立的集成测试文件：
+所有测试统一在 `test/integration/admin_cmd_test.go`，使用 Docker PostgreSQL 16 + MySQL Go Client 进行真实 e2e 测试：
 
 ```
-test/integration/
-├── replication_admin_test.go    # Phase 1: START/STOP SLAVE, SHOW SLAVE STATUS
-├── semisync_readonly_test.go    # Phase 2: 半同步参数, read_only
-├── acl_test.go                  # Phase 3: CREATE USER, GRANT, REVOKE
-├── server_admin_test.go         # Phase 4: SHOW PROCESSLIST, KILL
-└── backup_test.go               # Phase 5: 备份恢复
+test/integration/admin_cmd_test.go    # 18 个测试函数, 50+ 子测试
+├── TestReplicationControl            # START/STOP SLAVE, SHOW SLAVE STATUS, RESET MASTER
+├── TestShowMasterStatus              # SHOW MASTER STATUS
+├── TestShowBinaryLogs                # SHOW BINARY LOGS
+├── TestGTIDVariables                 # SET GLOBAL gtid_purged, SELECT @@gtid_mode
+├── TestSemiSync                      # SET GLOBAL rpl_semi_sync_*, SHOW GLOBAL STATUS
+├── TestReadOnlyControl               # SET GLOBAL read_only/super_read_only + read back
+├── TestACL                           # CREATE/DROP USER, GRANT, REVOKE, FLUSH PRIVILEGES
+├── TestConfigVariables               # server_id, max_connections, wait_timeout, report_host
+├── TestServerStatus                  # SELECT @@version, SHOW PROCESSLIST
+├── TestBinlogManagement              # SET SESSION sql_log_bin, binlog_format, log_bin
+├── TestMiscFeatures                  # foreign_key_checks, KILL, FLUSH TABLES, TABLESPACE
+├── TestShowCommandsAdmin             # 12 SHOW commands
+├── TestDDL                           # CREATE TABLE (MySQL types), ALTER, INDEX, TRUNCATE
+├── TestDMLAndTransactions            # INSERT, UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK
+├── TestFunctionConversions           # NOW, IF, IFNULL, CONCAT, RAND, math, string
+├── TestQuerySyntax                   # LIMIT offset,count, GROUP BY, DISTINCT, UNION, FOR UPDATE
+├── TestSwitchoverCommandSequence     # Full switchover simulation
+└── TestCRUD_E2E                      # Complete CRUD lifecycle
 ```
 
-测试要点：
-- 使用标准 MySQL 客户端连接 MyProxy 执行管理命令
-- 验证 PostgreSQL 后端状态是否符合预期
-- 模拟主从切换全流程端到端测试
+测试链路: `MySQL Go Client → MyProxy :13306 → PostgreSQL 16 Docker :15432`
+测试 schema: 每次创建独立 `e2e_testdb`，不使用 public schema
