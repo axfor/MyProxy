@@ -400,24 +400,34 @@ The proxy automatically handles the following MySQL to PostgreSQL conversions:
 
 ### Replication Management Commands
 - ✅ START SLAVE / STOP SLAVE (incl. SQL_THREAD, IO_THREAD) → `pg_wal_replay_resume/pause()`
-- ✅ CHANGE MASTER TO → `ALTER SYSTEM SET primary_conninfo`
-- ✅ RESET SLAVE / RESET MASTER → `ALTER SYSTEM RESET` / `pg_switch_wal()`
-- ✅ SHOW SLAVE STATUS (incl. FOR CHANNEL) → `pg_stat_wal_receiver`
+- ✅ CHANGE MASTER TO (MASTER_HOST, MASTER_PORT, MASTER_USER, MASTER_PASSWORD, MASTER_AUTO_POSITION) → `ALTER SYSTEM SET primary_conninfo`
+- ✅ RESET SLAVE → `ALTER SYSTEM RESET primary_conninfo`
+- ✅ RESET MASTER → `pg_switch_wal()`
+- ✅ SHOW SLAVE STATUS (incl. FOR CHANNEL filtering) → `pg_stat_wal_receiver`
 - ✅ SHOW SLAVE HOSTS → `pg_stat_replication`
-- ✅ SHOW MASTER STATUS → `pg_current_wal_lsn()`
+- ✅ SHOW MASTER STATUS → `pg_current_wal_lsn()` + `pg_walfile_name()`
 - ✅ SHOW BINARY LOGS → `pg_ls_waldir()`
+- ✅ SHOW GLOBAL STATUS WHERE Variable_name='xxx' → status variable mapping
+- ✅ SHOW GLOBAL VARIABLES WHERE/LIKE 'xxx' → variable mapping
 
 ### Variable Mapping (SET GLOBAL / SELECT @@)
 - ✅ `read_only` / `super_read_only` → `default_transaction_read_only`
 - ✅ `rpl_semi_sync_master_enabled` → `synchronous_commit`
 - ✅ `rpl_semi_sync_slave_enabled` → NoOp (PG automatic)
-- ✅ `max_connections` → `max_connections` (ALTER SYSTEM)
-- ✅ `wait_timeout` → `idle_in_transaction_session_timeout`
-- ✅ `foreign_key_checks` → `session_replication_role`
-- ✅ `sql_log_bin` → `log_statement`
-- ✅ `server_id` / `server_uuid` / `report_host` → internal storage
+- ✅ `rpl_semi_sync_master_status` → query `synchronous_commit` setting
+- ✅ `rpl_semi_sync_master_clients` → `count(*) FROM pg_stat_replication WHERE sync_state='sync'`
+- ✅ `max_connections` → `max_connections` (ALTER SYSTEM, requires restart)
+- ✅ `wait_timeout` → `idle_in_transaction_session_timeout` (seconds→ms conversion)
+- ✅ `foreign_key_checks` → `session_replication_role` (0→replica, 1→origin)
+- ✅ `sql_log_bin` → `log_statement` (0→none, 1→all)
+- ✅ `server_id` / `server_uuid` / `report_host` → internal storage (runtime writable)
 - ✅ `gtid_purged` / `gtid_mode` / `gtid_executed` → compatibility stubs
-- ✅ `@@version` → PostgreSQL `server_version`
+- ✅ `master_auto_position` → acknowledged (PG uses LSN auto-positioning by default)
+- ✅ `binlog_format` → static `ROW` / `log_bin` → static `ON`
+- ✅ `@@version` → PostgreSQL `server_version` + `-MyProxy` suffix
+- ✅ `@@version_comment` → `MyProxy (MySQL to PostgreSQL Proxy)`
+- ✅ Character sets (`character_set_*`, `collation_*`) → static `utf8mb4`/`utf8mb4_general_ci`
+- ✅ `sql_mode` / `max_allowed_packet` / `net_*_timeout` → static compatibility values
 
 ### ACL Management (AST-based)
 - ✅ CREATE USER → `CREATE ROLE ... WITH LOGIN PASSWORD`
