@@ -408,7 +408,8 @@ The proxy automatically handles the following MySQL to PostgreSQL conversions:
 - ✅ SHOW MASTER STATUS → `pg_current_wal_lsn()` + `pg_walfile_name()`
 - ✅ SHOW BINARY LOGS → `pg_ls_waldir()`
 - ✅ SHOW GLOBAL STATUS WHERE Variable_name='xxx' → status variable mapping
-- ✅ SHOW GLOBAL VARIABLES WHERE/LIKE 'xxx' → variable mapping
+- ✅ SHOW GLOBAL VARIABLES WHERE/LIKE 'xxx' → variable mapping table lookup
+- ✅ SHOW VARIABLES LIKE 'xxx' → variable mapping table first, then `pg_settings` fallback
 
 ### Variable Mapping (SET GLOBAL / SELECT @@)
 - ✅ `read_only` / `super_read_only` → `default_transaction_read_only`
