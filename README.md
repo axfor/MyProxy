@@ -1,3 +1,5 @@
+
+
 # MySQL to PostgreSQL Proxy
 
 A high-performance MySQL protocol proxy that transparently translates MySQL client requests to PostgreSQL backend calls, enabling MySQL clients to access PostgreSQL databases without code modification.
@@ -18,9 +20,9 @@ A high-performance MySQL protocol proxy that transparently translates MySQL clie
 │ │  - Handshake & Authentication                                │   │
 │ │  - COM_QUERY / COM_PREPARE / COM_STMT_EXECUTE                │   │
 │ │  - ResultSet Encoding (Field Packets)                        │   │
-│ └────────────────────┬─────────────────────────────────────────┘   │
-│                      │                                             │
-│ ┌────────────────────▼─────────────────────────────────────────┐   │
+└────────────────────┬─────────────────────────────────────────┘   │
+                     │                                             │
+┌────────────────────▼─────────────────────────────────────────┐   │
 │ │  SQL Rewrite Engine (pkg/sqlrewrite) - Hybrid AST + String   │   │
 │ │  ┌──────────────────────────────────────────────────────┐    │   │
 │ │  │ 1. SQL Parser: MySQL SQL → AST                       │    │   │
@@ -41,38 +43,38 @@ A high-performance MySQL protocol proxy that transparently translates MySQL clie
 │ │  │    - LIMIT: LIMIT n,m → LIMIT m OFFSET n             │    │   │
 │ │  │    - Keywords: CURRENT_TIMESTAMP() → CURRENT_TIMESTAMP│   │   │
 │ │  └──────────────────────────────────────────────────────┘    │   │
-│ └────────────────────┬─────────────────────────────────────────┘   │
-│                      │                                             │
-│ ┌────────────────────▼─────────────────────────────────────────┐   │
+└────────────────────┬─────────────────────────────────────────┘   │
+                     │                                             │
+┌────────────────────▼─────────────────────────────────────────┐   │
 │ │  Type Mapper (pkg/mapper)                                    │   │
 │ │  - MySQL ↔ PostgreSQL data type conversion                   │   │
 │ │  - Error code mapping (PostgreSQL → MySQL Error Codes)       │   │
 │ │  - SHOW/DESCRIBE command emulation                           │   │
-│ └────────────────────┬─────────────────────────────────────────┘   │
-│                      │                                             │
-│ ┌────────────────────▼─────────────────────────────────────────┐   │
+└────────────────────┬─────────────────────────────────────────┘   │
+                     │                                             │
+┌────────────────────▼─────────────────────────────────────────┐   │
 │ │  Session Manager (pkg/session)                               │   │
 │ │  - Session state tracking                                    │   │
 │ │  - Transaction control (BEGIN/COMMIT/ROLLBACK)               │   │
 │ │  - Prepared statement caching                                │   │
 │ │  - Session variable management                               │   │
-│ └────────────────────┬─────────────────────────────────────────┘   │
-│                      │                                             │
-│ ┌────────────────────▼─────────────────────────────────────────┐   │
+└────────────────────┬─────────────────────────────────────────┘   │
+                     │                                             │
+┌────────────────────▼─────────────────────────────────────────┐   │
 │ │  Schema Cache (pkg/schema) - Global Cache with Generics      │   │
 │ │  - AUTO_INCREMENT column detection (schema.table key)        │   │
 │ │  - Generic sync.Map (zero type assertion overhead)           │   │
 │ │  - TTL-based expiration (5min default, configurable)         │   │
 │ │  - DDL auto-invalidation (CREATE/ALTER/DROP TABLE)           │   │
 │ │  - 99% query reduction in concurrent scenarios               │   │
-│ └────────────────────┬─────────────────────────────────────────┘   │
-│                      │                                             │
-│ ┌────────────────────▼─────────────────────────────────────────┐   │
+└────────────────────┬─────────────────────────────────────────┘   │
+                     │                                             │
+┌────────────────────▼─────────────────────────────────────────┐   │
 │ │  Connection Pool (internal/pool)                             │   │
 │ │  - pgx connection pool management                            │   │
 │ │  - Session affinity / pooled mode                            │   │
 │ │  - Health checks                                             │   │
-│ └────────────────────┬─────────────────────────────────────────┘   │
+└────────────────────┬─────────────────────────────────────────┘   │
 └────────────────────────┼───────────────────────────────────────────┘
                          │ PostgreSQL Protocol (pgx)
                          │
@@ -260,7 +262,7 @@ GOEXPERIMENT=greenteagc go build -o bin/aproxy ./cmd/aproxy
 Copy the example configuration file and modify as needed:
 
 ```bash
-cp configs/config.yaml configs/config.yaml
+cp configs/config.yaml.example configs/config.yaml
 ```
 
 Edit `configs/config.yaml`:
